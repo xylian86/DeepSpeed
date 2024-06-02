@@ -149,7 +149,6 @@ def extract_zero_shards(dir, ds_checkpoint, indices_3D):
 
 def extract_zero_shards_stage3(optim_files, param_shapes, dp_degree, temp_dir, dp_index):
     state_dict = torch.load(optim_files[dp_index], map_location='cpu')
-    param_shapes = {k: v for d in param_shapes for k, v in d.items()}
 
     flat_state = dict(
         exp_avg=state_dict[OPTIMIZER_STATE_DICT]['optimizer_state_dict']['state'][0]["exp_avg"],
@@ -551,6 +550,7 @@ def main(args):
     else:
         model_files = _get_model_state_files(args.input_folder)
         param_shapes = _parse_model_states_stage3(model_files)
+        param_shapes = {k: v for d in param_shapes for k, v in d.items()}
         dp_degree = len(model_files)
 
         temp_dir = os.path.join(args.output_folder, 'tmp')
