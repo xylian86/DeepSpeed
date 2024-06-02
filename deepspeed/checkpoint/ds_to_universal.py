@@ -147,6 +147,27 @@ def extract_zero_shards(dir, ds_checkpoint, indices_3D):
                                     fragment_mapping.start, fragment_mapping.numel)
 
 
+def extract_zero_shards_stage3(optim_files, param_shapes, dp_degree, temp_dir, dp_index):
+    state_dict = torch.load(optim_files[dp_index], map_location='cpu')
+    param_shapes = {k: v for d in param_shapes for k, v in d.items()}
+
+    flat_state = dict(
+        exp_avg=state_dict[OPTIMIZER_STATE_DICT]['optimizer_state_dict']['state'][0]["exp_avg"],
+        exp_avg_sq=state_dict[OPTIMIZER_STATE_DICT]['optimizer_state_dict']['state'][0]["exp_avg_sq"],
+        fp32=state_dict[OPTIMIZER_STATE_DICT]['fp32_flat_groups'][0],
+    )
+
+    offset = 0
+    for name, shape in param_shapes.items():
+        unpartitioned_numel = shape.numel()
+        partitioned_numel, _ = _zero_partitioned_param_info(unpartitioned_numel, dp_degree)
+
+        for state_key in flat_state.keys():
+            dump_param_fragment(temp_dir, 0, dp_index, state_key, flat_state[state_key], name,
+                                offset, partitioned_numel)
+        offset += unpartitioned_numel
+
+
 cnt = 0
 
 
@@ -310,6 +331,11 @@ def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
     return unmatched_patterns
 
 
+# def merge_zero3_slices(dp_degree, zero_output_folder, temp_dir, name):
+#     for state_key in ("fp32", "exp_avg", "exp_avg_sq"):
+#         slice_files = glob.glob(os.path.join(temp_dir, f"{state}.pt"))
+
+
 def _do_parallel_work(do_work, work_chunks, num_workers):
     results = []
     if num_workers > 1:
@@ -335,6 +361,11 @@ def _extract_zero_shard_files(args, ds_checkpoint, temp_dir):
     _do_parallel_work(do_work, _3d_range_list, args.num_extract_workers)
 
 
+def _extract_zero_shard_files_stage3(args, optim_files, param_shapes, dp_degree, temp_dir):
+    do_work = partial(extract_zero_shards_stage3, optim_files, param_shapes, dp_degree, temp_dir)
+    _do_parallel_work(do_work, list(range(dp_degree)), args.num_extract_workers)
+
+
 def _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir):
     zero_output_folder = os.path.join(args.output_folder, "zero")
     do_work = partial(merge_tp_slices, ds_checkpoint, zero_output_folder, temp_dir, ds_checkpoint.tp_degree)
@@ -348,6 +379,12 @@ def _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir):
         assert not unmatched_patterns, f'Unused patterns={unmatched_patterns} while merging tp slices'
     elif unmatched_patterns:
         print(f'Warning: Unused patterns={unmatched_patterns} while merging tp slices')
+
+
+# def _merge_zero3_slice_files(args, param_shapes, dp_degree, temp_dir):
+#     zero_output_folder = os.path.join(args.output_folder, "zero")
+#     do_work = partial(merge_zero3_slices, dp_degree, zero_output_folder, temp_dir)
+#     _do_parallel_work(do_work, list(param_shapes.keys()), args.num_merge_workers)
 
 
 def _zero_partitioned_param_info(unpartitioned_numel, world_size):
@@ -505,33 +542,33 @@ def main(args):
     else:
         model_files = _get_model_state_files(args.input_folder)
         param_shapes = _parse_model_states_stage3(model_files)
-        world_size = _parse_optim_states_stage3(optim_files)
+        dp_degree = len(model_files)
 
-        print('*** 1. Merging slices .....')
-        for key in ['fp32', 'exp_avg', 'exp_avg_sq']:
-            key_tensors = _parse_optim_states_stage3(optim_files, key)
-            key_state_dict = OrderedDict()
-            _merge_zero3_slice_tensors(key_tensors, key_state_dict, world_size, param_shapes)
+        temp_dir = os.path.join(args.output_folder, 'tmp')
 
-            for layer, value in key_state_dict.items():
-                os.makedirs(os.path.join(args.output_folder, "zero", layer), exist_ok=True)
-                torch.save(value, os.path.join(args.output_folder, "zero", layer, f"{key}.pt"))
+        print('*** 1. Extracting ZeRO fragments')
+        _extract_zero_shard_files_stage3(args, optim_files, param_shapes, dp_degree, temp_dir)
+
+        print('*** 2. Merging slices .....')
+        # _merge_zero3_slice_files(args, param_shapes, dp_degree, temp_dir)
 
         print('*** 2. Saving common optimizer states')
-        _save_optimizer_state_stage3(args, optim_files)
+        # _save_optimizer_state_stage3(args, optim_files)
 
-
-       # Copy *model_states files into output folder
-        for f in glob.glob(os.path.join(args.input_folder, '*model_states.pt')):
-            shutil.copy2(f, args.output_folder)
+       #  if not args.keep_temp_folder:
+       #      shutil.rmtree(temp_dir, ignore_errors=True)
+       #
+       # # Copy *model_states files into output folder
+       #  for f in glob.glob(os.path.join(args.input_folder, '*model_states.pt')):
+       #      shutil.copy2(f, args.output_folder)
 
     # Update latest to output folder
-    checkpoint_root_folder, step_folder = os.path.split(args.output_folder)
-    latest_file = os.path.join(checkpoint_root_folder, 'latest_universal')
-    with open(latest_file, "w") as f:
-        f.write(step_folder)
-
-    print('*** Done!')
+    # checkpoint_root_folder, step_folder = os.path.split(args.output_folder)
+    # latest_file = os.path.join(checkpoint_root_folder, 'latest_universal')
+    # with open(latest_file, "w") as f:
+    #     f.write(step_folder)
+    #
+    # print('*** Done!')
 
 
 if __name__ == "__main__":
