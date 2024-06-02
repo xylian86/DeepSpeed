@@ -5,7 +5,6 @@
 
 # DeepSpeed Team
 
-from collections import OrderedDict
 from functools import partial
 from itertools import chain
 import argparse
@@ -175,7 +174,6 @@ def dp_index_to_str(dp_index):
 
 
 def dump_param_fragment(dir, tp_index, dp_index, state_name, state_flat_tensor, param_name, offset, numel):
-
     global cnt  # temp hack
 
     param_base_path = os.path.join(dir, param_name, str(tp_index))
@@ -228,7 +226,6 @@ def _merge_zero_shards(param_base_path, state, tp_degree, slice_shape=None):
 
 
 def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
-
     name, shape = name_and_shape
     slice_base_path = os.path.join(slice_dir, name)
     param_base_path = os.path.join(dir, name)
@@ -298,7 +295,7 @@ def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
 
             sub_dim_sizes = matched_sub_params_shape.shape[partition_dim]
             if not isinstance(sub_dim_sizes, tuple):
-                sub_dim_sizes = (sub_dim_sizes, )
+                sub_dim_sizes = (sub_dim_sizes,)
 
             partition_shape = [sum(d) if isinstance(d, tuple) else d for d in matched_sub_params_shape.shape]
             partition_shape = [d // tp_degree if i == partition_dim else d for i, d in enumerate(partition_shape)]
@@ -334,7 +331,6 @@ def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
 
 
 def merge_zero3_slices(dp_degree, dir, slice_dir, name):
-
     slice_base_path = os.path.join(slice_dir, name)
     param_base_path = os.path.join(dir, name)
 
@@ -420,7 +416,7 @@ def _merge_zero3_slice_tensors(key_tensors, key_state_dict, world_size, param_sh
         key_state_dict[name] = torch.cat(
             tuple(key_tensors[i].narrow(0, offset, partitioned_numel) for i in range(world_size)),
             0).narrow(0, 0, unpartitioned_numel).view(shape)
-        
+
         offset += partitioned_numel
 
     offset *= world_size
@@ -449,14 +445,14 @@ def _parse_optim_states_stage3(optim_files, key=None):
             key_tensors.append(state_dict[OPTIMIZER_STATE_DICT]['optimizer_state_dict']['state'][0][key])
         else:
             raise ValueError(f"Invalid key={key}")
-        
+
         del state_dict
         gc.collect()
 
     # if key == "fp32":
-        # return torch.cat(key_tensors)
+    # return torch.cat(key_tensors)
     return key_tensors
-        
+
 
 def _save_optimizer_state(args, ds_checkpoint):
     sharded_states = [BASE_OPTIMIZER_STATE, PARAM_SLICE_MAPPINGS, SINGLE_PARTITION_OF_FP32_GROUPS]
@@ -495,10 +491,12 @@ def _get_checkpoint_files(checkpoint_dir, glob_pattern):
 
     return ckpt_files
 
+
 def _get_zero_stage(optim_files):
     state_dict = torch.load(optim_files[0], map_location=torch.device('cpu'))
     zero_stage = state_dict[OPTIMIZER_STATE_DICT][ZERO_STAGE]
     return zero_stage
+
 
 def _check_for_required_state(ds_checkpoint):
     universal_checkpoint_info = ds_checkpoint.get_checkpoint_info(UNIVERSAL_CHECKPOINT_INFO)
@@ -562,22 +560,22 @@ def main(args):
         _merge_zero3_slice_files(args, param_shapes, dp_degree, temp_dir)
 
         print('*** 3. Saving common optimizer states')
-        # _save_optimizer_state_stage3(args, optim_files)
+        _save_optimizer_state_stage3(args, optim_files)
 
-       #  if not args.keep_temp_folder:
-       #      shutil.rmtree(temp_dir, ignore_errors=True)
-       #
-       # # Copy *model_states files into output folder
-       #  for f in glob.glob(os.path.join(args.input_folder, '*model_states.pt')):
-       #      shutil.copy2(f, args.output_folder)
+        if not args.keep_temp_folder:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        # Copy *model_states files into output folder
+        for f in glob.glob(os.path.join(args.input_folder, '*model_states.pt')):
+            shutil.copy2(f, args.output_folder)
 
     # Update latest to output folder
-    # checkpoint_root_folder, step_folder = os.path.split(args.output_folder)
-    # latest_file = os.path.join(checkpoint_root_folder, 'latest_universal')
-    # with open(latest_file, "w") as f:
-    #     f.write(step_folder)
-    #
-    # print('*** Done!')
+    checkpoint_root_folder, step_folder = os.path.split(args.output_folder)
+    latest_file = os.path.join(checkpoint_root_folder, 'latest_universal')
+    with open(latest_file, "w") as f:
+        f.write(step_folder)
+
+    print('*** Done!')
 
 
 if __name__ == "__main__":
