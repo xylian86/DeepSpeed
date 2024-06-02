@@ -194,7 +194,7 @@ def dump_param_fragment(dir, tp_index, dp_index, state_name, state_flat_tensor, 
     _save_checkpoint(path, state_flat_tensor)
 
 
-def _merge_zero_shards(param_base_path, state, tp_degree, slice_shape):
+def _merge_zero_shards(param_base_path, state, tp_degree, slice_shape=None):
     slices = []
     for tp_index in range(tp_degree):
         prefix_path = os.path.join(param_base_path, str(tp_index), f"{state}")
@@ -219,7 +219,10 @@ def _merge_zero_shards(param_base_path, state, tp_degree, slice_shape):
             assert all(v == shards[0] for v in shards), "All shards must have the same step value"
             slice = shards[0]
         else:
-            slice = torch.cat(shards, dim=0).reshape(slice_shape)
+            if slice_shape is None:
+                slice = torch.cat(shards, dim=0)
+            else:
+                slice = torch.cat(shards, dim=0).reshape(slice_shape)
 
         slices.append(slice)
     return slices
@@ -331,9 +334,15 @@ def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
     return unmatched_patterns
 
 
-# def merge_zero3_slices(dp_degree, zero_output_folder, temp_dir, name):
-#     for state_key in ("fp32", "exp_avg", "exp_avg_sq"):
-#         slice_files = glob.glob(os.path.join(temp_dir, f"{state}.pt"))
+def merge_zero3_slices(dp_degree, dir, slice_dir, name):
+
+    slice_base_path = os.path.join(slice_dir, name)
+    param_base_path = os.path.join(dir, name)
+
+    for state in ("fp32", "exp_avg", "exp_avg_sq"):
+        slices = _merge_zero_shards(slice_base_path, state, 1)
+        final_path = os.path.join(param_base_path, f"{state}.pt")
+        _save_checkpoint(final_path, slices[0])
 
 
 def _do_parallel_work(do_work, work_chunks, num_workers):
@@ -381,10 +390,10 @@ def _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir):
         print(f'Warning: Unused patterns={unmatched_patterns} while merging tp slices')
 
 
-# def _merge_zero3_slice_files(args, param_shapes, dp_degree, temp_dir):
-#     zero_output_folder = os.path.join(args.output_folder, "zero")
-#     do_work = partial(merge_zero3_slices, dp_degree, zero_output_folder, temp_dir)
-#     _do_parallel_work(do_work, list(param_shapes.keys()), args.num_merge_workers)
+def _merge_zero3_slice_files(args, param_shapes, dp_degree, temp_dir):
+    zero_output_folder = os.path.join(args.output_folder, "zero")
+    do_work = partial(merge_zero3_slices, dp_degree, zero_output_folder, temp_dir)
+    _do_parallel_work(do_work, param_shapes.keys(), args.num_merge_workers)
 
 
 def _zero_partitioned_param_info(unpartitioned_numel, world_size):
@@ -550,9 +559,9 @@ def main(args):
         _extract_zero_shard_files_stage3(args, optim_files, param_shapes, dp_degree, temp_dir)
 
         print('*** 2. Merging slices .....')
-        # _merge_zero3_slice_files(args, param_shapes, dp_degree, temp_dir)
+        _merge_zero3_slice_files(args, param_shapes, dp_degree, temp_dir)
 
-        print('*** 2. Saving common optimizer states')
+        print('*** 3. Saving common optimizer states')
         # _save_optimizer_state_stage3(args, optim_files)
 
        #  if not args.keep_temp_folder:
