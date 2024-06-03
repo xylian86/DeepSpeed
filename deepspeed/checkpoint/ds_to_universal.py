@@ -8,7 +8,6 @@
 from functools import partial
 from itertools import chain
 import argparse
-import gc
 import glob
 import itertools
 import math
@@ -24,7 +23,6 @@ from deepspeed.checkpoint import DeepSpeedCheckpoint
 from deepspeed.checkpoint import (
     OPTIMIZER_STATE_DICT,
     ZERO_STAGE,
-    PARTITION_COUNT,
     BASE_OPTIMIZER_STATE,
     SINGLE_PARTITION_OF_FP32_GROUPS,
     PARAM_GROUPS,
@@ -398,60 +396,8 @@ def _zero_partitioned_param_info(unpartitioned_numel, world_size):
     return partitioned_numel, padding_numel
 
 
-def _merge_zero3_slice_tensors(key_tensors, key_state_dict, world_size, param_shapes):
-    avail_numel = key_tensors[0].numel() * world_size
-
-    param_shapes = {k: v for d in param_shapes for k, v in d.items()}
-
-    offset = 0
-    total_numel = 0
-    total_params = 0
-
-    for name, shape in param_shapes.items():
-        unpartitioned_numel = shape.numel()
-        total_numel += unpartitioned_numel
-        total_params += 1
-
-        partitioned_numel, _ = _zero_partitioned_param_info(unpartitioned_numel, world_size)
-        key_state_dict[name] = torch.cat(
-            tuple(key_tensors[i].narrow(0, offset, partitioned_numel) for i in range(world_size)),
-            0).narrow(0, 0, unpartitioned_numel).view(shape)
-
-        offset += partitioned_numel
-
-    offset *= world_size
-
-    if offset != avail_numel:
-        raise ValueError(f"consumed {offset} numels out of {avail_numel} - something is wrong")
-
-
 def _parse_model_states_stage3(files):
     return torch.load(files[0], map_location=torch.device('cpu'))[PARAM_SHAPES]
-
-
-def _parse_optim_states_stage3(optim_files, key=None):
-    key_tensors = []
-    for optim_file in optim_files:
-        state_dict = torch.load(optim_file, map_location='cpu')
-
-        if key is None:
-            world_size = state_dict[OPTIMIZER_STATE_DICT][PARTITION_COUNT]
-            if isinstance(world_size, list):
-                world_size = max(world_size)
-            return world_size
-        elif key == "fp32":
-            key_tensors.append(state_dict[OPTIMIZER_STATE_DICT]['fp32_flat_groups'][0])
-        elif key in ["exp_avg", "exp_avg_sq"]:
-            key_tensors.append(state_dict[OPTIMIZER_STATE_DICT]['optimizer_state_dict']['state'][0][key])
-        else:
-            raise ValueError(f"Invalid key={key}")
-
-        del state_dict
-        gc.collect()
-
-    # if key == "fp32":
-    # return torch.cat(key_tensors)
-    return key_tensors
 
 
 def _save_optimizer_state(args, ds_checkpoint):
@@ -467,7 +413,7 @@ def _save_optimizer_state(args, ds_checkpoint):
 
 
 def _save_optimizer_state_stage3(args, optim_files):
-    sd = torch.load(os.path.join(optim_files[0]), map_location=torch.device('cpu'))
+    sd = torch.load(optim_files[0], map_location=torch.device('cpu'))
     output_sd = sd[OPTIMIZER_STATE_DICT]
     output_sd[PARAM_GROUPS] = output_sd[OPTIMIZER_STATE_DICT][PARAM_GROUPS]
     zero_output_folder = os.path.join(args.output_folder, "zero")
