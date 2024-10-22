@@ -150,12 +150,15 @@ def extract_zero_shards(dir, ds_checkpoint, indices_3D):
 
 
 def extract_zero_shards_stage3(optim_files, param_shapes, dp_degree, temp_dir, dp_index):
-    state_dict = torch.load(optim_files[dp_index], map_location='cpu')
+    state_dict = torch.load(optim_files[dp_index], map_location='cpu')[OPTIMIZER_STATE_DICT]
+    exp_avg_list = [i['exp_avg'] for i in state_dict['optimizer_state_dict']['state'].values()]
+    exp_avg_sq_list = [i['exp_avg_sq'] for i in state_dict['optimizer_state_dict']['state'].values()]
+    fp32_list = [i for i in state_dict['fp32_flat_groups']]
 
     flat_state = dict(
-        exp_avg=state_dict[OPTIMIZER_STATE_DICT]['optimizer_state_dict']['state'][0]["exp_avg"],
-        exp_avg_sq=state_dict[OPTIMIZER_STATE_DICT]['optimizer_state_dict']['state'][0]["exp_avg_sq"],
-        fp32=state_dict[OPTIMIZER_STATE_DICT]['fp32_flat_groups'][0],
+        exp_avg=torch.cat(exp_avg_list, dim=0),
+        exp_avg_sq=torch.cat(exp_avg_sq_list, dim=0),
+        fp32=torch.cat(fp32_list, dim=0),
     )
 
     offset = 0
