@@ -28,6 +28,8 @@ void Adam_Optimizer::Step_1(ds_params_precision_t* _params,
     size_t rounded_size = 0;
 #if defined(__AVX512__) or defined(__AVX256__)
     Step_AVX<1>(&rounded_size, _params, grads, _exp_avg, _exp_avg_sq, _param_size);
+#elif defined(__ARM_FEATURE_SVE)
+    Step_SVE<1>(&rounded_size, _params, grads, _exp_avg, _exp_avg_sq, _param_size);
 #endif
     if (_param_size > rounded_size) {
         float betta1_minus1 = 1 - _betta1;
@@ -77,6 +79,8 @@ void Adam_Optimizer::Step_4(ds_params_precision_t* _params,
     size_t rounded_size = 0;
 #if defined(__AVX512__) or defined(__AVX256__)
     Step_AVX<4>(&rounded_size, _params, grads, _exp_avg, _exp_avg_sq, _param_size);
+#elif defined(__ARM_FEATURE_SVE)
+    Step_SVE<4>(&rounded_size, _params, grads, _exp_avg, _exp_avg_sq, _param_size);
 #endif
     if (_param_size > rounded_size)
         Step_1((_params + rounded_size),
@@ -136,6 +140,8 @@ void Adam_Optimizer::Step_8(ds_params_precision_t* _params,
     size_t rounded_size = 0;
 #if defined(__AVX512__) or defined(__AVX256__)
     Step_AVX<8>(&rounded_size, _params, grads, _exp_avg, _exp_avg_sq, _param_size);
+#elif defined(__ARM_FEATURE_SVE)
+    Step_SVE<8>(&rounded_size, _params, grads, _exp_avg, _exp_avg_sq, _param_size);
 #endif
     if (_param_size > rounded_size)
         Step_4((_params + rounded_size),
@@ -175,10 +181,10 @@ void create_invoker()
 struct InvokerInitializer {
     InvokerInitializer()
     {
-        create_invoker<c10::Half, float>();
-        create_invoker<c10::Half, c10::Half>();
-        create_invoker<c10::BFloat16, float>();
-        create_invoker<c10::BFloat16, c10::BFloat16>();
+        // create_invoker<c10::Half, float>();
+        // create_invoker<c10::Half, c10::Half>();
+        // create_invoker<c10::BFloat16, float>();
+        // create_invoker<c10::BFloat16, c10::BFloat16>();
         create_invoker<float, float>();
     }
 } _invoker_initializer;

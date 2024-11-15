@@ -40,4 +40,18 @@ Functionality for swapping optimizer tensors to/from (NVMe) storage devices.
 #endif
 #endif
 
+#if defined(__ARM_FEATURE_SVE)
+// Predicate for full vector operations
+static inline svbool_t get_pred() { return svptrue_b32(); }
+// Helper macros with predication handled internally
+#define SIMD_STORE(a, d) svst1_f32(get_pred(), a, d)
+#define SIMD_LOAD(x) svld1_f32(get_pred(), x)
+#define SIMD_SET(x) svdup_n_f32(x)
+#define SIMD_MUL(x, y) svmul_f32_x(get_pred(), x, y)
+#define SIMD_FMA(x, y, c) svmad_f32_x(get_pred(), x, y, c)
+#define SIMD_SQRT(x) svsqrt_f32_x(get_pred(), x)
+#define SIMD_DIV(x, y) svdiv_f32_x(get_pred(), x, y)
+#define SIMD_WIDTH 16
+#endif
+
 int deepspeed_py_memcpy(torch::Tensor& dest, const torch::Tensor& src);

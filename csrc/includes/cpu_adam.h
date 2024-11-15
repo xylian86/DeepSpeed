@@ -12,6 +12,11 @@
 #include <torch/extension.h>
 #include <cassert>
 #include "simd.h"
+#include "sve.h"
+
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
 
 #define STEP(SPAN)                                                           \
     template <typename ds_params_precision_t, typename ds_state_precision_t> \
@@ -41,7 +46,15 @@ public:
     {
     }
     ~Adam_Optimizer() {}
-
+#if defined(__ARM_FEATURE_SVE)
+    template <int span, typename ds_params_precision_t, typename ds_state_precision_t>
+    void Step_SVE(size_t* rounded_size,
+                  ds_params_precision_t* _params,
+                  ds_params_precision_t* grads,
+                  ds_state_precision_t* _exp_avg,
+                  ds_state_precision_t* _exp_avg_sq,
+                  size_t param_size);
+#endif
 #if defined(__AVX512__) or defined(__AVX256__)
     template <int span, typename ds_params_precision_t, typename ds_state_precision_t>
     void Step_AVX(size_t* rounded_size,
@@ -192,6 +205,106 @@ void Adam_Optimizer::Step_AVX(size_t* rounded_size,
         }
     }
     *rounded_size = new_rounded_size;
+}
+#endif
+
+#if defined(__ARM_FEATURE_SVE)
+template <int span, typename ds_params_precision_t, typename ds_state_precision_t>
+void Adam_Optimizer::Step_SVE(size_t* rounded_size,
+                              ds_params_precision_t* _params,
+                              ds_params_precision_t* grads,
+                              ds_state_precision_t* _exp_avg,
+                              ds_state_precision_t* _exp_avg_sq,
+                              size_t _param_size)
+{
+    if (!std::is_same_v<ds_params_precision_t, float> ||
+        !std::is_same_v<ds_state_precision_t, float>) {
+        return;
+    }
+
+    *rounded_size = ROUND_DOWN(_param_size, SIMD_WIDTH * span);
+
+    // Pre-compute constants
+    SVE_Data beta1_data, beta2_data, beta1_minus1_data, beta2_minus1_data, eps_data, step_size_data;
+    
+    svst1_f32(SIMD_PRED, beta1_data.data_f, svdup_n_f32(_betta1));
+    svst1_f32(SIMD_PRED, beta2_data.data_f, svdup_n_f32(_betta2));
+    svst1_f32(SIMD_PRED, beta1_minus1_data.data_f, svdup_n_f32(1.0f - _betta1));
+    svst1_f32(SIMD_PRED, beta2_minus1_data.data_f, svdup_n_f32(1.0f - _betta2));
+    svst1_f32(SIMD_PRED, eps_data.data_f, svdup_n_f32(_eps));
+    svst1_f32(SIMD_PRED, step_size_data.data_f, svdup_n_f32(-_alpha / _bias_correction1)); 
+
+    float w_decay = -1 * _alpha * _weight_decay;
+    SVE_Data weight_decay_data;
+    if (_weight_decay > 0) {
+        svst1_f32(SIMD_PRED, weight_decay_data.data_f, 
+                  svdup_n_f32(_adamw_mode ? w_decay : _weight_decay));
+    }
+
+#pragma omp parallel for
+    for (size_t t = 0; t < *rounded_size; t += TILE) {
+        const size_t current_size = ((*rounded_size - t) < TILE) ? (*rounded_size - t) : TILE;
+        
+        for (size_t i = t; i < t + current_size; i += SIMD_WIDTH) {
+            SVE_Data params_data, grads_data, exp_avg_data, exp_avg_sq_data;
+            
+            simd_load_4(&params_data, _params, i);
+            simd_load_4(&grads_data, grads, i);
+            simd_load_4(&exp_avg_data, _exp_avg, i);
+            simd_load_4(&exp_avg_sq_data, _exp_avg_sq, i);
+
+            // Apply weight decay if needed
+            if (_weight_decay > 0 && !_adamw_mode) {
+                svfloat32_t params_vec = svld1_f32(SIMD_PRED, params_data.data_f);
+                svfloat32_t grads_vec = svld1_f32(SIMD_PRED, grads_data.data_f);
+                svfloat32_t weight_decay_vec = svld1_f32(SIMD_PRED, weight_decay_data.data_f);
+                
+                grads_vec = svmad_f32_x(SIMD_PRED, params_vec, weight_decay_vec, grads_vec);
+                svst1_f32(SIMD_PRED, grads_data.data_f, grads_vec);
+            }
+
+            // Update momentum
+            svfloat32_t momentum = svld1_f32(SIMD_PRED, exp_avg_data.data_f);
+            svfloat32_t grads_vec = svld1_f32(SIMD_PRED, grads_data.data_f);
+            momentum = svmul_f32_x(SIMD_PRED, momentum, svld1_f32(SIMD_PRED, beta1_data.data_f));
+            momentum = svmad_f32_x(SIMD_PRED, grads_vec, svld1_f32(SIMD_PRED, beta1_minus1_data.data_f), momentum);
+            
+            // Update variance
+            svfloat32_t variance = svld1_f32(SIMD_PRED, exp_avg_sq_data.data_f);
+            svfloat32_t grad_sq = svmul_f32_x(SIMD_PRED, grads_vec, grads_vec);
+            variance = svmul_f32_x(SIMD_PRED, variance, svld1_f32(SIMD_PRED, beta2_data.data_f));
+            variance = svmad_f32_x(SIMD_PRED, grad_sq, svld1_f32(SIMD_PRED, beta2_minus1_data.data_f), variance);
+
+            // Compute update
+            svfloat32_t update = svdiv_f32_x(SIMD_PRED, momentum,
+                svadd_f32_x(SIMD_PRED,
+                    svmul_f32_x(SIMD_PRED, 
+                        svsqrt_f32_x(SIMD_PRED, variance),
+                        svdup_n_f32(_bias_correction2)),
+                    svld1_f32(SIMD_PRED, eps_data.data_f)));
+
+            // Apply weight decay if in ADAMW mode
+            svfloat32_t params_vec = svld1_f32(SIMD_PRED, params_data.data_f);
+            if (_weight_decay > 0 && _adamw_mode) {
+                svfloat32_t weight_decay_vec = svld1_f32(SIMD_PRED, weight_decay_data.data_f);
+                params_vec = svmad_f32_x(SIMD_PRED, params_vec, weight_decay_vec, params_vec);
+            }
+
+            // Update parameters
+            params_vec = svmad_f32_x(SIMD_PRED, update, svld1_f32(SIMD_PRED, step_size_data.data_f), params_vec);
+
+           // Store results back
+            svst1_f32(SIMD_PRED, params_data.data_f, params_vec);
+            svst1_f32(SIMD_PRED, exp_avg_data.data_f, momentum);
+            svst1_f32(SIMD_PRED, exp_avg_sq_data.data_f, variance);
+
+            // Store results
+            simd_store_4(_params, &params_data, i);
+            simd_store_4(_exp_avg, &exp_avg_data, i);
+            simd_store_4(_exp_avg_sq, &exp_avg_sq_data, i);
+        }
+    }
+
 }
 #endif
 

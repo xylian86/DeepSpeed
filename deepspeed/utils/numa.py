@@ -122,7 +122,7 @@ def get_numactl_cmd(bind_core_list, num_local_procs, local_rank):
     numa_cores = get_numa_cores()
     num_numas = len(numa_cores)
 
-    numa_mode = "normal"
+    numa_mode = "GH"
 
     non_empty_numa_list = []
     empty_numa_list = []
@@ -198,5 +198,6 @@ def get_numactl_cmd(bind_core_list, num_local_procs, local_rank):
             last_core = core_id
     if first_core != last_core:
         core_list_str = f"{core_list_str}-{last_core}"
+    core_list_str = "72-143"
     numactl_cmd.append(f"{core_list_str}")
     return cores_per_rank, numactl_cmd
