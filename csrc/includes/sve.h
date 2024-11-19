@@ -1,3 +1,8 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+// DeepSpeed Team
+
 #pragma once
 
 #if defined(__ARM_FEATURE_SVE)
@@ -18,10 +23,11 @@ inline void writeAs(void* dst, const T& val)
 }
 
 #define ROUND_DOWN(size, step) ((size) & ~((step) - 1))
-#define TILE (512 * 1024)
+#define TILE 512
 
 // SVE SIMD macros
 #define SIMD_WIDTH 4
+#define VECTOR_UNROLL 4
 #define SIMD_PRED svptrue_pat_b32(SV_VL4)  // Predicate for exactly 4 elements
 #define SIMD_STORE(dst, src) svst1_f32(SIMD_PRED, dst, src)
 #define SIMD_LOAD(x) svld1_f32(svptrue_b32(), x)
@@ -34,18 +40,27 @@ inline void writeAs(void* dst, const T& val)
 
 // Optimized SVE Data structure for 128-bit vectors
 union SVE_Data {
-    float data_f[4] __attribute__((aligned(16))); // 16-byte alignment for 128-bit vectors
+    float data_f[4] __attribute__((aligned(16)));  // 16-byte alignment for 128-bit vectors
+};
+
+// Optimized constants for better cache locality
+struct AdamConstants {
+    SVE_Data beta1;
+    SVE_Data beta2;
+    SVE_Data beta1_minus1;
+    SVE_Data beta2_minus1;
+    SVE_Data eps;
+    SVE_Data step_size;
+    SVE_Data weight_decay;
 };
 
 // Fixed predicate for exactly 4 elements
-inline svbool_t get_sve_pred_4() {
-    return svptrue_pat_b32(SV_VL4);
-}
+inline svbool_t get_sve_pred_4() { return svptrue_pat_b32(SV_VL4); }
 
 // Optimized load for 4-wide vectors
 template <typename T>
-inline void simd_load_4(SVE_Data* dst, T* src, size_t offset) {
-
+inline void simd_load_4(SVE_Data* dst, T* src, size_t offset)
+{
     if constexpr (std::is_same_v<T, float>) {
         svfloat32_t data = svld1_f32(SIMD_PRED, src + offset);
         svst1_f32(SIMD_PRED, dst->data_f, data);
@@ -59,9 +74,10 @@ inline void simd_load_4(SVE_Data* dst, T* src, size_t offset) {
 
 // Optimized store for 4-wide vectors
 template <typename T>
-inline void simd_store_4(T* dst, SVE_Data* src, size_t offset) {
+inline void simd_store_4(T* dst, SVE_Data* src, size_t offset)
+{
     svfloat32_t data = svld1_f32(SIMD_PRED, src->data_f);
-    
+
     if constexpr (std::is_same_v<T, float>) {
         svst1_f32(SIMD_PRED, dst + offset, data);
     } else if constexpr (std::is_same_v<T, c10::Half>) {
@@ -71,14 +87,14 @@ inline void simd_store_4(T* dst, SVE_Data* src, size_t offset) {
 }
 
 template <int span>
-inline void simd_fma_4(SVE_Data* dst, SVE_Data* src1, SVE_Data* src2, SVE_Data* acc) {
-    
-    #pragma unroll 4
+inline void simd_fma_4(SVE_Data* dst, SVE_Data* src1, SVE_Data* src2, SVE_Data* acc)
+{
+#pragma unroll 4
     for (int i = 0; i < span; i++) {
         svfloat32_t v1 = svld1_f32(SIMD_PRED, src1[i].data_f);
         svfloat32_t v2 = svld1_f32(SIMD_PRED, src2[i].data_f);
         svfloat32_t va = svld1_f32(SIMD_PRED, acc[i].data_f);
-        
+
         // Optimized FMA for 4-wide vectors
         svfloat32_t result = svmad_f32_x(SIMD_PRED, v1, v2, va);
         svst1_f32(SIMD_PRED, dst[i].data_f, result);
@@ -101,17 +117,10 @@ static void store_sve_fp16_from_f32(svfloat32_t v, void* data)
 #define SIMD_LOAD_FP16(x) load_sve_fp16_as_f32(x)
 #define SIMD_STORE_FP16(x, d) store_sve_fp16_from_f32(d, x)
 
-
 // Helper functions to load/store SVE vectors
-inline svfloat32_t load_sve_data(const SVE_Data& d)
-{
-    return svld1_f32(SIMD_PRED, d.data_f);
-}
+inline svfloat32_t load_sve_data(const SVE_Data& d) { return svld1_f32(SIMD_PRED, d.data_f); }
 
-inline void store_sve_data(SVE_Data& d, svfloat32_t vec)
-{
-    svst1_f32(SIMD_PRED, d.data_f, vec);
-}
+inline void store_sve_data(SVE_Data& d, svfloat32_t vec) { svst1_f32(SIMD_PRED, d.data_f, vec); }
 
 template <int span, typename T>
 inline typename std::enable_if_t<std::is_same_v<T, c10::Half>, void> simd_store(T* dst,
@@ -148,7 +157,8 @@ inline typename std::enable_if_t<std::is_same_v<T, c10::Half>, void> simd_load(S
 #pragma unroll
     for (size_t i = 0; i < span; ++i) {
         // Convert FP16 to FP32 and load
-        svfloat32_t tmp = svcvt_f32_f16_x(SIMD_PRED, svld1_f16(SIMD_PRED, (float16_t*)(src + width * i)));
+        svfloat32_t tmp =
+            svcvt_f32_f16_x(SIMD_PRED, svld1_f16(SIMD_PRED, (float16_t*)(src + width * i)));
         store_sve_data(dst[i], tmp);
     }
 }

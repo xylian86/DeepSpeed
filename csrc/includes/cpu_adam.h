@@ -224,87 +224,121 @@ void Adam_Optimizer::Step_SVE(size_t* rounded_size,
 
     *rounded_size = ROUND_DOWN(_param_size, SIMD_WIDTH * span);
 
-    // Pre-compute constants
-    SVE_Data beta1_data, beta2_data, beta1_minus1_data, beta2_minus1_data, eps_data, step_size_data;
-    
-    svst1_f32(SIMD_PRED, beta1_data.data_f, svdup_n_f32(_betta1));
-    svst1_f32(SIMD_PRED, beta2_data.data_f, svdup_n_f32(_betta2));
-    svst1_f32(SIMD_PRED, beta1_minus1_data.data_f, svdup_n_f32(1.0f - _betta1));
-    svst1_f32(SIMD_PRED, beta2_minus1_data.data_f, svdup_n_f32(1.0f - _betta2));
-    svst1_f32(SIMD_PRED, eps_data.data_f, svdup_n_f32(_eps));
-    svst1_f32(SIMD_PRED, step_size_data.data_f, svdup_n_f32(-_alpha / _bias_correction1)); 
+    AdamConstants constants __attribute__((aligned(64)));
 
-    float w_decay = -1 * _alpha * _weight_decay;
-    SVE_Data weight_decay_data;
+    // Initialize constants using vectorized operations
+    svfloat32_t beta1_vec = svdup_n_f32(_betta1);
+    svfloat32_t beta2_vec = svdup_n_f32(_betta2);
+    svfloat32_t beta1_m1_vec = svdup_n_f32(1.0f - _betta1);
+    svfloat32_t beta2_m1_vec = svdup_n_f32(1.0f - _betta2);
+    svfloat32_t eps_vec = svdup_n_f32(_eps);
+    svfloat32_t step_vec = svdup_n_f32(-_alpha / _bias_correction1);
+
+    svst1_f32(SIMD_PRED, constants.beta1.data_f, beta1_vec);
+    svst1_f32(SIMD_PRED, constants.beta2.data_f, beta2_vec);
+    svst1_f32(SIMD_PRED, constants.beta1_minus1.data_f, beta1_m1_vec);
+    svst1_f32(SIMD_PRED, constants.beta2_minus1.data_f, beta2_m1_vec);
+    svst1_f32(SIMD_PRED, constants.eps.data_f, eps_vec);
+    svst1_f32(SIMD_PRED, constants.step_size.data_f, step_vec);
+
     if (_weight_decay > 0) {
-        svst1_f32(SIMD_PRED, weight_decay_data.data_f, 
-                  svdup_n_f32(_adamw_mode ? w_decay : _weight_decay));
+        float w_decay = _adamw_mode ? -1 * _alpha * _weight_decay : _weight_decay;
+        svst1_f32(SIMD_PRED, constants.weight_decay.data_f, svdup_n_f32(w_decay));
     }
+
+    const float bias_correction2_float = _bias_correction2;
 
 #pragma omp parallel for
     for (size_t t = 0; t < *rounded_size; t += TILE) {
         const size_t current_size = ((*rounded_size - t) < TILE) ? (*rounded_size - t) : TILE;
-        
-        for (size_t i = t; i < t + current_size; i += SIMD_WIDTH) {
-            SVE_Data params_data, grads_data, exp_avg_data, exp_avg_sq_data;
-            
-            simd_load_4(&params_data, _params, i);
-            simd_load_4(&grads_data, grads, i);
-            simd_load_4(&exp_avg_data, _exp_avg, i);
-            simd_load_4(&exp_avg_sq_data, _exp_avg_sq, i);
 
-            // Apply weight decay if needed
-            if (_weight_decay > 0 && !_adamw_mode) {
-                svfloat32_t params_vec = svld1_f32(SIMD_PRED, params_data.data_f);
-                svfloat32_t grads_vec = svld1_f32(SIMD_PRED, grads_data.data_f);
-                svfloat32_t weight_decay_vec = svld1_f32(SIMD_PRED, weight_decay_data.data_f);
-                
-                grads_vec = svmad_f32_x(SIMD_PRED, params_vec, weight_decay_vec, grads_vec);
-                svst1_f32(SIMD_PRED, grads_data.data_f, grads_vec);
+#pragma unroll VECTOR_UNROLL
+        for (size_t i = t; i < t + current_size; i += SIMD_WIDTH * VECTOR_UNROLL) {
+            SVE_Data params_data[VECTOR_UNROLL], grads_data[VECTOR_UNROLL];
+            SVE_Data exp_avg_data[VECTOR_UNROLL], exp_avg_sq_data[VECTOR_UNROLL];
+
+#pragma unroll VECTOR_UNROLL
+            for (int j = 0; j < VECTOR_UNROLL; j++) {
+                const size_t offset = i + j * SIMD_WIDTH;
+                if (offset < t + current_size) {
+                    simd_load_4(&params_data[j], _params, offset);
+                    simd_load_4(&grads_data[j], grads, offset);
+                    simd_load_4(&exp_avg_data[j], _exp_avg, offset);
+                    simd_load_4(&exp_avg_sq_data[j], _exp_avg_sq, offset);
+                }
             }
 
-            // Update momentum
-            svfloat32_t momentum = svld1_f32(SIMD_PRED, exp_avg_data.data_f);
-            svfloat32_t grads_vec = svld1_f32(SIMD_PRED, grads_data.data_f);
-            momentum = svmul_f32_x(SIMD_PRED, momentum, svld1_f32(SIMD_PRED, beta1_data.data_f));
-            momentum = svmad_f32_x(SIMD_PRED, grads_vec, svld1_f32(SIMD_PRED, beta1_minus1_data.data_f), momentum);
-            
-            // Update variance
-            svfloat32_t variance = svld1_f32(SIMD_PRED, exp_avg_sq_data.data_f);
-            svfloat32_t grad_sq = svmul_f32_x(SIMD_PRED, grads_vec, grads_vec);
-            variance = svmul_f32_x(SIMD_PRED, variance, svld1_f32(SIMD_PRED, beta2_data.data_f));
-            variance = svmad_f32_x(SIMD_PRED, grad_sq, svld1_f32(SIMD_PRED, beta2_minus1_data.data_f), variance);
+#pragma unroll VECTOR_UNROLL
+            for (int j = 0; j < VECTOR_UNROLL; j++) {
+                const size_t offset = i + j * SIMD_WIDTH;
+                if (offset >= t + current_size) continue;
 
-            // Compute update
-            svfloat32_t update = svdiv_f32_x(SIMD_PRED, momentum,
-                svadd_f32_x(SIMD_PRED,
-                    svmul_f32_x(SIMD_PRED, 
-                        svsqrt_f32_x(SIMD_PRED, variance),
-                        svdup_n_f32(_bias_correction2)),
-                    svld1_f32(SIMD_PRED, eps_data.data_f)));
+                // Load vectors once and reuse
+                svfloat32_t params_vec = svld1_f32(SIMD_PRED, params_data[j].data_f);
+                svfloat32_t grads_vec = svld1_f32(SIMD_PRED, grads_data[j].data_f);
+                svfloat32_t momentum = svld1_f32(SIMD_PRED, exp_avg_data[j].data_f);
+                svfloat32_t variance = svld1_f32(SIMD_PRED, exp_avg_sq_data[j].data_f);
 
-            // Apply weight decay if in ADAMW mode
-            svfloat32_t params_vec = svld1_f32(SIMD_PRED, params_data.data_f);
-            if (_weight_decay > 0 && _adamw_mode) {
-                svfloat32_t weight_decay_vec = svld1_f32(SIMD_PRED, weight_decay_data.data_f);
-                params_vec = svmad_f32_x(SIMD_PRED, params_vec, weight_decay_vec, params_vec);
+                // Apply weight decay if needed (fused operation)
+                if (_weight_decay > 0 && !_adamw_mode) {
+                    svfloat32_t weight_decay_vec =
+                        svld1_f32(SIMD_PRED, constants.weight_decay.data_f);
+                    grads_vec = svmad_f32_x(SIMD_PRED, params_vec, weight_decay_vec, grads_vec);
+                }
+
+                // Update momentum (fused multiply-add)
+                svfloat32_t beta1_vec = svld1_f32(SIMD_PRED, constants.beta1.data_f);
+                svfloat32_t beta1_m1_vec = svld1_f32(SIMD_PRED, constants.beta1_minus1.data_f);
+                momentum = svmad_f32_x(SIMD_PRED,
+                                       momentum,
+                                       beta1_vec,
+                                       svmul_f32_x(SIMD_PRED, grads_vec, beta1_m1_vec));
+
+                // Update variance (fused multiply-add)
+                svfloat32_t beta2_vec = svld1_f32(SIMD_PRED, constants.beta2.data_f);
+                svfloat32_t beta2_m1_vec = svld1_f32(SIMD_PRED, constants.beta2_minus1.data_f);
+                svfloat32_t grad_sq = svmul_f32_x(SIMD_PRED, grads_vec, grads_vec);
+                variance = svmad_f32_x(
+                    SIMD_PRED, variance, beta2_vec, svmul_f32_x(SIMD_PRED, grad_sq, beta2_m1_vec));
+
+                // Compute update (fused operations)
+                svfloat32_t sqrt_variance = svsqrt_f32_x(SIMD_PRED, variance);
+                svfloat32_t denom = svadd_f32_x(
+                    SIMD_PRED,
+                    svmul_f32_x(SIMD_PRED, sqrt_variance, svdup_n_f32(bias_correction2_float)),
+                    svld1_f32(SIMD_PRED, constants.eps.data_f));
+
+                svfloat32_t update = svdiv_f32_x(SIMD_PRED, momentum, denom);
+
+                // Apply weight decay in ADAMW mode
+                if (_weight_decay > 0 && _adamw_mode) {
+                    svfloat32_t weight_decay_vec =
+                        svld1_f32(SIMD_PRED, constants.weight_decay.data_f);
+                    params_vec = svmad_f32_x(SIMD_PRED, params_vec, weight_decay_vec, params_vec);
+                }
+
+                // Update parameters (fused multiply-add)
+                svfloat32_t step_vec = svld1_f32(SIMD_PRED, constants.step_size.data_f);
+                params_vec = svmad_f32_x(SIMD_PRED, update, step_vec, params_vec);
+
+                // Store results
+                svst1_f32(SIMD_PRED, params_data[j].data_f, params_vec);
+                svst1_f32(SIMD_PRED, exp_avg_data[j].data_f, momentum);
+                svst1_f32(SIMD_PRED, exp_avg_sq_data[j].data_f, variance);
             }
 
-            // Update parameters
-            params_vec = svmad_f32_x(SIMD_PRED, update, svld1_f32(SIMD_PRED, step_size_data.data_f), params_vec);
-
-           // Store results back
-            svst1_f32(SIMD_PRED, params_data.data_f, params_vec);
-            svst1_f32(SIMD_PRED, exp_avg_data.data_f, momentum);
-            svst1_f32(SIMD_PRED, exp_avg_sq_data.data_f, variance);
-
-            // Store results
-            simd_store_4(_params, &params_data, i);
-            simd_store_4(_exp_avg, &exp_avg_data, i);
-            simd_store_4(_exp_avg_sq, &exp_avg_sq_data, i);
+// Batch store results
+#pragma unroll VECTOR_UNROLL
+            for (int j = 0; j < VECTOR_UNROLL; j++) {
+                const size_t offset = i + j * SIMD_WIDTH;
+                if (offset < t + current_size) {
+                    simd_store_4(_params, &params_data[j], offset);
+                    simd_store_4(_exp_avg, &exp_avg_data[j], offset);
+                    simd_store_4(_exp_avg_sq, &exp_avg_data[j], offset);
+                }
+            }
         }
     }
-
 }
 #endif
 
