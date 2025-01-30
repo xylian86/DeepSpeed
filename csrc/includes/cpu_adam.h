@@ -18,10 +18,15 @@
 #include <arm_sve.h>
 #endif
 
+// Add prefetch hints to avoid cache pollution
+// Use PREFETCH_HINT_NTA (0) to bypass L3 cache on Grace CPU
+#define PREFETCH_HINT_T0 0  // Changed from 3 to 0 to bypass L3
+#define PREFETCH_HINT_NTA 0
+
 #define STEP(SPAN)                                                           \
     template <typename ds_params_precision_t, typename ds_state_precision_t> \
     void Step_##SPAN(ds_params_precision_t* _params,                         \
-                     ds_params_precision_t* grads,                           \
+                     ds_params_precision_t* grads,                         \
                      ds_state_precision_t* _exp_avg,                         \
                      ds_state_precision_t* _exp_avg_sq,                      \
                      size_t _param_size);
@@ -44,6 +49,12 @@ public:
           _step(0),
           _adamw_mode(adamw_mode)
     {
+        // Prefetch constants using non-temporal hint to bypass L3 cache
+        __builtin_prefetch(&_alpha, 0, PREFETCH_HINT_NTA);
+        __builtin_prefetch(&_betta1, 0, PREFETCH_HINT_NTA);
+        __builtin_prefetch(&_betta2, 0, PREFETCH_HINT_NTA);
+        __builtin_prefetch(&_eps, 0, PREFETCH_HINT_NTA);
+        __builtin_prefetch(&_weight_decay, 0, PREFETCH_HINT_NTA);
     }
     ~Adam_Optimizer() {}
 #if defined(__ARM_FEATURE_SVE)
@@ -102,20 +113,21 @@ public:
     }
 
 private:
-    float _alpha;
-    float _betta1;
-    float _betta2;
-    float _eps;
-    float _weight_decay;
+    // Align data to cache line boundary to avoid false sharing
+    alignas(64) float _alpha;
+    alignas(64) float _betta1;
+    alignas(64) float _betta2;
+    alignas(64) float _eps;
+    alignas(64) float _weight_decay;
 
-    float _betta1_t;
-    float _betta2_t;
-    size_t _step;
+    alignas(64) float _betta1_t;
+    alignas(64) float _betta2_t;
+    alignas(64) size_t _step;
 
-    float _bias_correction1;
-    float _bias_correction2;
+    alignas(64) float _bias_correction1;
+    alignas(64) float _bias_correction2;
 
-    bool _adamw_mode;
+    alignas(64) bool _adamw_mode;
 };
 
 #if defined(__AVX512__) or defined(__AVX256__)
@@ -134,6 +146,14 @@ void Adam_Optimizer::Step_AVX(size_t* rounded_size,
     }
 #endif
     size_t new_rounded_size = 0;
+
+    // Prefetch data using non-temporal hint to bypass L3 cache
+    for (size_t i = 0; i < _param_size; i += 64) {
+        __builtin_prefetch(_params + i, 0, PREFETCH_HINT_NTA);
+        __builtin_prefetch(grads + i, 0, PREFETCH_HINT_NTA);
+        __builtin_prefetch(_exp_avg + i, 0, PREFETCH_HINT_NTA);
+        __builtin_prefetch(_exp_avg_sq + i, 0, PREFETCH_HINT_NTA);
+    }
 
     AVX_Data betta1_4;
     betta1_4.data = SIMD_SET(_betta1);
@@ -199,6 +219,7 @@ void Adam_Optimizer::Step_AVX(size_t* rounded_size,
 
             simd_fma<span>(param_4, grad_4, step_size_4, param_4);
 
+            // Use non-temporal stores to bypass cache
             simd_store<span>(_params + i, param_4);
             simd_store<span>(_exp_avg + i, momentum_4);
             simd_store<span>(_exp_avg_sq + i, variance_4);
@@ -221,8 +242,16 @@ void Adam_Optimizer::Step_SVE(size_t* rounded_size,
         !std::is_same_v<ds_state_precision_t, float>) {
         return;
     }
-
+    printf("Step_SVE\n");
     *rounded_size = ROUND_DOWN(_param_size, SIMD_WIDTH * span);
+
+    // Prefetch data using non-temporal hint to bypass L3 cache
+    for (size_t i = 0; i < _param_size; i += 64) {
+        __builtin_prefetch(_params + i, 0, PREFETCH_HINT_NTA);
+        __builtin_prefetch(grads + i, 0, PREFETCH_HINT_NTA);
+        __builtin_prefetch(_exp_avg + i, 0, PREFETCH_HINT_NTA);
+        __builtin_prefetch(_exp_avg_sq + i, 0, PREFETCH_HINT_NTA);
+    }
 
     AdamConstants constants __attribute__((aligned(64)));
 
@@ -261,10 +290,17 @@ void Adam_Optimizer::Step_SVE(size_t* rounded_size,
             for (int j = 0; j < VECTOR_UNROLL; j++) {
                 const size_t offset = i + j * SIMD_WIDTH;
                 if (offset < t + current_size) {
-                    simd_load_4(&params_data[j], _params, offset);
-                    simd_load_4(&grads_data[j], grads, offset);
-                    simd_load_4(&exp_avg_data[j], _exp_avg, offset);
-                    simd_load_4(&exp_avg_sq_data[j], _exp_avg_sq, offset);
+                    // Use non-temporal loads to bypass cache
+                    svfloat32_t params_vec = SIMD_NT_LOAD(_params + offset);
+                    svfloat32_t grads_vec = SIMD_NT_LOAD(grads + offset);
+                    svfloat32_t exp_avg_vec = SIMD_NT_LOAD(_exp_avg + offset);
+                    svfloat32_t exp_avg_sq_vec = SIMD_NT_LOAD(_exp_avg_sq + offset);
+                    
+                    // Use streaming stores to bypass all cache levels and write directly to memory
+                    SIMD_NT_STORE(params_data[j].data_f, params_vec);
+                    SIMD_NT_STORE(grads_data[j].data_f, grads_vec);
+                    SIMD_NT_STORE(exp_avg_data[j].data_f, exp_avg_vec);
+                    SIMD_NT_STORE(exp_avg_sq_data[j].data_f, exp_avg_sq_vec);
                 }
             }
 
@@ -273,68 +309,63 @@ void Adam_Optimizer::Step_SVE(size_t* rounded_size,
                 const size_t offset = i + j * SIMD_WIDTH;
                 if (offset >= t + current_size) continue;
 
-                // Load vectors once and reuse
-                svfloat32_t params_vec = svld1_f32(SIMD_PRED, params_data[j].data_f);
-                svfloat32_t grads_vec = svld1_f32(SIMD_PRED, grads_data[j].data_f);
-                svfloat32_t momentum = svld1_f32(SIMD_PRED, exp_avg_data[j].data_f);
-                svfloat32_t variance = svld1_f32(SIMD_PRED, exp_avg_sq_data[j].data_f);
+                // Load vectors from local data using non-temporal loads
+                svfloat32_t params_vec = SIMD_NT_LOAD(params_data[j].data_f);
+                svfloat32_t grads_vec = SIMD_NT_LOAD(grads_data[j].data_f); 
+                svfloat32_t momentum = SIMD_NT_LOAD(exp_avg_data[j].data_f);
+                svfloat32_t variance = SIMD_NT_LOAD(exp_avg_sq_data[j].data_f);
 
                 // Apply weight decay if needed (fused operation)
                 if (_weight_decay > 0 && !_adamw_mode) {
-                    svfloat32_t weight_decay_vec =
-                        svld1_f32(SIMD_PRED, constants.weight_decay.data_f);
+                    svfloat32_t weight_decay_vec = SIMD_NT_LOAD(constants.weight_decay.data_f);
                     grads_vec = svmad_f32_x(SIMD_PRED, params_vec, weight_decay_vec, grads_vec);
                 }
 
                 // Update momentum (fused multiply-add)
-                svfloat32_t beta1_vec = svld1_f32(SIMD_PRED, constants.beta1.data_f);
-                svfloat32_t beta1_m1_vec = svld1_f32(SIMD_PRED, constants.beta1_minus1.data_f);
-                momentum = svmad_f32_x(SIMD_PRED,
-                                       momentum,
-                                       beta1_vec,
-                                       svmul_f32_x(SIMD_PRED, grads_vec, beta1_m1_vec));
+                svfloat32_t beta1_vec = SIMD_NT_LOAD(constants.beta1.data_f);
+                svfloat32_t beta1_m1_vec = SIMD_NT_LOAD(constants.beta1_minus1.data_f);
+                momentum = svmad_f32_x(SIMD_PRED, momentum, beta1_vec,
+                                     svmul_f32_x(SIMD_PRED, grads_vec, beta1_m1_vec));
 
                 // Update variance (fused multiply-add)
-                svfloat32_t beta2_vec = svld1_f32(SIMD_PRED, constants.beta2.data_f);
-                svfloat32_t beta2_m1_vec = svld1_f32(SIMD_PRED, constants.beta2_minus1.data_f);
+                svfloat32_t beta2_vec = SIMD_NT_LOAD(constants.beta2.data_f);
+                svfloat32_t beta2_m1_vec = SIMD_NT_LOAD(constants.beta2_minus1.data_f);
                 svfloat32_t grad_sq = svmul_f32_x(SIMD_PRED, grads_vec, grads_vec);
-                variance = svmad_f32_x(
-                    SIMD_PRED, variance, beta2_vec, svmul_f32_x(SIMD_PRED, grad_sq, beta2_m1_vec));
+                variance = svmad_f32_x(SIMD_PRED, variance, beta2_vec,
+                                     svmul_f32_x(SIMD_PRED, grad_sq, beta2_m1_vec));
 
-                // Compute update (fused operations)
+                // Compute update
                 svfloat32_t sqrt_variance = svsqrt_f32_x(SIMD_PRED, variance);
-                svfloat32_t denom = svadd_f32_x(
-                    SIMD_PRED,
+                svfloat32_t denom = svadd_f32_x(SIMD_PRED,
                     svmul_f32_x(SIMD_PRED, sqrt_variance, svdup_n_f32(bias_correction2_float)),
-                    svld1_f32(SIMD_PRED, constants.eps.data_f));
+                    SIMD_NT_LOAD(constants.eps.data_f));
 
                 svfloat32_t update = svdiv_f32_x(SIMD_PRED, momentum, denom);
 
                 // Apply weight decay in ADAMW mode
                 if (_weight_decay > 0 && _adamw_mode) {
-                    svfloat32_t weight_decay_vec =
-                        svld1_f32(SIMD_PRED, constants.weight_decay.data_f);
+                    svfloat32_t weight_decay_vec = SIMD_NT_LOAD(constants.weight_decay.data_f);
                     params_vec = svmad_f32_x(SIMD_PRED, params_vec, weight_decay_vec, params_vec);
                 }
 
-                // Update parameters (fused multiply-add)
-                svfloat32_t step_vec = svld1_f32(SIMD_PRED, constants.step_size.data_f);
+                // Update parameters
+                svfloat32_t step_vec = SIMD_NT_LOAD(constants.step_size.data_f);
                 params_vec = svmad_f32_x(SIMD_PRED, update, step_vec, params_vec);
 
-                // Store results
-                svst1_f32(SIMD_PRED, params_data[j].data_f, params_vec);
-                svst1_f32(SIMD_PRED, exp_avg_data[j].data_f, momentum);
-                svst1_f32(SIMD_PRED, exp_avg_sq_data[j].data_f, variance);
+                // Store results back using non-temporal stores
+                SIMD_NT_STORE(params_data[j].data_f, params_vec);
+                SIMD_NT_STORE(exp_avg_data[j].data_f, momentum);
+                SIMD_NT_STORE(exp_avg_sq_data[j].data_f, variance);
             }
 
-// Batch store results
 #pragma unroll VECTOR_UNROLL
             for (int j = 0; j < VECTOR_UNROLL; j++) {
                 const size_t offset = i + j * SIMD_WIDTH;
                 if (offset < t + current_size) {
-                    simd_store_4(_params, &params_data[j], offset);
-                    simd_store_4(_exp_avg, &exp_avg_data[j], offset);
-                    simd_store_4(_exp_avg_sq, &exp_avg_data[j], offset);
+                    // Use non-temporal stores to bypass cache
+                    SIMD_NT_STORE(_params + offset, svld1_f32(SIMD_PRED, params_data[j].data_f));
+                    SIMD_NT_STORE(_exp_avg + offset, svld1_f32(SIMD_PRED, exp_avg_data[j].data_f));
+                    SIMD_NT_STORE(_exp_avg_sq + offset, svld1_f32(SIMD_PRED, exp_avg_sq_data[j].data_f));
                 }
             }
         }

@@ -159,7 +159,7 @@ void step_invoker(std::shared_ptr<Adam_Optimizer> opt,
                   void* _exp_avg_sq,
                   size_t _param_size)
 {
-    opt->Step_8((ds_params_precision_t*)(_params),
+    opt->Step_1((ds_params_precision_t*)(_params),
                 (ds_params_precision_t*)(grads),
                 (ds_state_precision_t*)(_exp_avg),
                 (ds_state_precision_t*)(_exp_avg_sq),
