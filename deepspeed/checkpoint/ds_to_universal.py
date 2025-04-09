@@ -139,6 +139,8 @@ def extract_zero_shards(dir, ds_checkpoint, indices_3D):
             flat_state["step"] = state_groups[param_group_id]["step"]
 
         for name, fragment_mapping in param_slice_mappings[param_group_id].items():
+            if "expert" in name:
+                continue
             if pp_index > 0 and any(re.match(pattern, name) for pattern in pipeline_replicated_params):
                 # Skip tied weights that are replicated in first and last pp stages
                 continue
@@ -365,7 +367,7 @@ def _extract_zero_shard_files(args, ds_checkpoint, temp_dir):
         itertools.product(range(ds_checkpoint.pp_degree), range(ds_checkpoint.tp_degree),
                           range(ds_checkpoint.dp_degree)))
     #pprint(f'{_3d_range_list=}')
-
+    print(f"pp_degree={ds_checkpoint.pp_degree}, tp_degree={ds_checkpoint.tp_degree}, dp_degree={ds_checkpoint.dp_degree}")
     do_work = partial(extract_zero_shards, temp_dir, ds_checkpoint)
     _do_parallel_work(do_work, _3d_range_list, args.num_extract_workers)
 
@@ -429,7 +431,7 @@ def _save_optimizer_state_stage3(args, optim_files):
 
 
 def _get_optim_files(checkpoint_dir):
-    return _get_checkpoint_files(checkpoint_dir, "*_optim_states.pt")
+    return _get_checkpoint_files(checkpoint_dir, "zero*_optim_states.pt")
 
 
 def _get_model_state_files(checkpoint_dir):
@@ -465,6 +467,21 @@ def _check_for_required_state(ds_checkpoint):
     universal_checkpoint_info = ds_checkpoint.get_checkpoint_info(UNIVERSAL_CHECKPOINT_INFO)
     assert universal_checkpoint_info is not None, f'Required {UNIVERSAL_CHECKPOINT_INFO} state is missing in checkpoint. Verify that client creates this state.'
 
+def _copy_moe_model_parameters(args, ds_checkpoint):
+    zero_output_folder = os.path.join(args.output_folder, "zero")
+    moe_model_files = []
+    for f in glob.glob(os.path.join(args.input_folder, 'layer_*_expert_*')):
+        moe_model_files.append(f)
+    for f in moe_model_files:
+        print(f"Processing MoE layer {f}")
+        moe_model_state = torch.load(f, map_location=torch.device('cpu'), weights_only=False)
+        for key, value in moe_model_state.items():
+            # Cast from fp16 to fp32
+            value = value.to(torch.float32) if value.dtype == torch.float16 else value
+            os.makedirs(os.path.join(zero_output_folder, key), exist_ok=True)
+            output_file_path = os.path.join(zero_output_folder, key, f"fp32.pt")
+            _save_checkpoint(output_file_path, value)
+
 
 def main(args):
     print(f'Convert DeepSpeed Checkpoint to Universal Checkpoint')
@@ -489,7 +506,25 @@ def main(args):
         slice_shapes = []
         for mp_rank_file in ds_checkpoint.mp_rank_files:
             mp_sd = torch.load(mp_rank_file, map_location=torch.device('cpu'), weights_only=False)
-            slice_shapes += mp_sd[PARAM_SHAPES]
+            
+            # Extract parameter names and shapes from the model state dict
+            if 'module' in mp_sd:
+                model_state = mp_sd['module']
+                # Recursively traverse the nested dictionaries to find all tensors
+                param_shapes = {}
+                
+                def extract_shapes(prefix, state_dict):
+                    for key, value in state_dict.items():
+                        name = f"{prefix}.{key}" if prefix else key
+                        if isinstance(value, torch.Tensor):
+                            param_shapes[name] = value.shape
+                        elif isinstance(value, dict):
+                            extract_shapes(name, value)
+                        elif isinstance(value, OrderedDict):
+                            extract_shapes(name, value)
+                
+                extract_shapes("", model_state)
+                slice_shapes.append(param_shapes)
 
         # fix back to normal flat dict, merge duplicates for tp>1
         slice_shapes = dict((k, v) for d in slice_shapes for k, v in d.items())
@@ -501,7 +536,10 @@ def main(args):
         print('*** 2. Merging slices .....')
         _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir)
 
-        print('*** 3. Saving common optimizer states')
+        print('*** 3. Saving the MoE model parameters')
+        _copy_moe_model_parameters(args, ds_checkpoint)
+
+        print('*** 4. Saving common optimizer states')
         _save_optimizer_state(args, ds_checkpoint)
 
         if not args.keep_temp_folder:

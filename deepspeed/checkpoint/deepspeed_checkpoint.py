@@ -22,7 +22,7 @@ FINAL_LAYER_NORM_INDEX = -1
 ARGS_KEY = 'args'
 CHECKPOINT_INFO_KEY = 'checkpoint_info'
 ITERATION_KEY = 'iteration'
-LAYER_FILE_PREFIX_PATTERN = r'layer_(\d+)-model_.*'
+LAYER_FILE_PREFIX_PATTERN = r'layer_(\d+)(?!_expert)(?:-model|\w)*'
 
 SEQUENTIAL_LAYERS = [
     'input_layernorm.weight', 'input_layernorm.bias', 'self_attention.dense.bias', 'post_attention_layernorm.weight',
@@ -43,14 +43,14 @@ class DeepSpeedCheckpoint(object):
         self.final_layer_norm_idx = final_layer_norm_idx
         self.dir = dir
 
-        pipeline_parallel = len(get_files_with_prefix(get_files(dir), LAYER_FILE_PREFIX)) > 0
+        pipeline_parallel = len(get_files_with_prefix(get_files(dir), LAYER_FILE_PREFIX_PATTERN)) > 0
 
         self._validate_folder(dir, pipeline_parallel)
 
         self.zero_checkpoint = ZeROCheckpoint(dir)
 
         self.file_list = get_files(dir)
-        self.layer_files = get_files_with_prefix(self.file_list, LAYER_FILE_PREFIX)
+        self.layer_files = get_files_with_prefix(self.file_list, LAYER_FILE_PREFIX_PATTERN)
         self.mp_rank_files = get_files_with_prefix(self.file_list, MODEL_FILE_PREFIX)
 
         self.layer_keys = self._get_layer_keys()
