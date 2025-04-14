@@ -2751,7 +2751,8 @@ class DeepSpeedEngine(Module):
                             model=None,
                             mpu=None,
                             num_experts=1,
-                            checkpoint_engine=TorchCheckpointEngine()):
+                            checkpoint_engine=TorchCheckpointEngine(),
+                            load_universal_checkpoint=False):
         if old_moe_load:
             expp_rank = groups._get_expert_data_parallel_rank(groups._get_max_expert_size_name())
 
@@ -2786,16 +2787,25 @@ class DeepSpeedEngine(Module):
                     # loop all local_experts
                     for local_expert_id in range(num_local_experts):
                         global_expert_id = expp_rank * num_local_experts + local_expert_id
-                        expert_state_dict = checkpoint_engine.load(DeepSpeedEngine._get_expert_ckpt_name(
-                            checkpoint_path, moe_layer_id, global_expert_id, tag, mpu),
-                                                                   map_location=torch.device('cpu'))
-                        # print(expert_state_dict.keys())
-                        # Updating global -> local expert ids
-                        moe_str_prefix = '.deepspeed_moe.experts.deepspeed_experts.'
-                        for key in list(expert_state_dict.keys()):
-                            local_key = key.replace(f'{moe_str_prefix}{global_expert_id}',
-                                                    f'{moe_str_prefix}{local_expert_id}')
-                            expert_state_dict[local_key] = expert_state_dict.pop(key)
+                        if load_universal_checkpoint:
+                            expert_state_dict = {}
+                            for param_suffix in ["dense_h_to_4h.weight", "dense_h_to_4h.bias", "dense_4h_to_h.weight", "dense_4h_to_h.bias"]:
+                                ckpt_name = os.path.join(checkpoint_path, '' if tag is None else str(tag), "zero",
+                                     f'{n_module}.deepspeed_moe.experts.deepspeed_experts.{local_expert_id}.{param_suffix}', "fp32.pt")
+                                expert_param_tensor = checkpoint_engine.load(ckpt_name, map_location=torch.device('cpu'))
+                                local_key = f'{n_module}.deepspeed_moe.experts.deepspeed_experts.{local_expert_id}.{param_suffix}'
+                                expert_state_dict[local_key] = expert_param_tensor
+                        else:
+                            expert_state_dict = checkpoint_engine.load(DeepSpeedEngine._get_expert_ckpt_name(
+                                checkpoint_path, moe_layer_id, global_expert_id, tag, mpu),
+                                                                    map_location=torch.device('cpu'))
+                            # print(expert_state_dict.keys())
+                            # Updating global -> local expert ids
+                            moe_str_prefix = '.deepspeed_moe.experts.deepspeed_experts.'
+                            for key in list(expert_state_dict.keys()):
+                                local_key = key.replace(f'{moe_str_prefix}{global_expert_id}',
+                                                        f'{moe_str_prefix}{local_expert_id}')
+                                expert_state_dict[local_key] = expert_state_dict.pop(key)
                         state_dict.update(expert_state_dict)
                     moe_layer_id += 1
 
@@ -3034,7 +3044,8 @@ class DeepSpeedEngine(Module):
                                                 model=self.module,
                                                 mpu=self.mpu,
                                                 num_experts=self.num_experts,
-                                                checkpoint_engine=self.checkpoint_engine)
+                                                checkpoint_engine=self.checkpoint_engine,
+                                                load_universal_checkpoint=self.load_universal_checkpoint())
         if not self.load_universal_checkpoint():
             self.load_module_state_dict(checkpoint=checkpoint,
                                         strict=load_module_strict,

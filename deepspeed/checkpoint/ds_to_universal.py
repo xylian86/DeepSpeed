@@ -134,13 +134,21 @@ def extract_zero_shards(dir, ds_checkpoint, indices_3D):
             exp_avg_sq=state_groups[param_group_id]["exp_avg_sq"],
             fp32=fp32_groups[param_group_id],
         )
+        local_expert_num = 0
+        for name in param_slice_mappings[param_group_id].keys():
+            if "expert" in name:
+                local_expert_id = int(re.search(r'deepspeed_experts\.(\d+)', name).group(1))
+                local_expert_num = max(local_expert_num, local_expert_id + 1)
 
         if "step" in state_groups[param_group_id]:
             flat_state["step"] = state_groups[param_group_id]["step"]
 
         for name, fragment_mapping in param_slice_mappings[param_group_id].items():
             if "expert" in name:
-                continue
+                local_expert_id = int(re.search(r'deepspeed_experts\.(\d+)', name).group(1))
+                global_expert_id = dp_index * local_expert_num + int(local_expert_id)
+                name = name.replace(f'deepspeed_experts.{local_expert_id}', f'deepspeed_experts.{global_expert_id}')
+
             if pp_index > 0 and any(re.match(pattern, name) for pattern in pipeline_replicated_params):
                 # Skip tied weights that are replicated in first and last pp stages
                 continue
@@ -478,9 +486,12 @@ def _copy_moe_model_parameters(args, ds_checkpoint):
         for key, value in moe_model_state.items():
             # Cast from fp16 to fp32
             value = value.to(torch.float32) if value.dtype == torch.float16 else value
+            saved_dict = {}
+            saved_dict['cat_dim'] = 0
+            saved_dict['param'] = value
             os.makedirs(os.path.join(zero_output_folder, key), exist_ok=True)
             output_file_path = os.path.join(zero_output_folder, key, f"fp32.pt")
-            _save_checkpoint(output_file_path, value)
+            _save_checkpoint(output_file_path, saved_dict)
 
 
 def main(args):
@@ -504,6 +515,8 @@ def main(args):
                                                     ds_checkpoint.pp_degree)
 
         slice_shapes = []
+
+        # Extract parameter names and shapes from the optimizer state dict for Non-MoE parameters 
         for mp_rank_file in ds_checkpoint.mp_rank_files:
             mp_sd = torch.load(mp_rank_file, map_location=torch.device('cpu'), weights_only=False)
             
@@ -524,6 +537,14 @@ def main(args):
                             extract_shapes(name, value)
                 
                 extract_shapes("", model_state)
+                slice_shapes.append(param_shapes)
+
+        # Extract parameter names and shapes from the model state dict for MoE parameters
+        for moe_model_state_file in glob.glob(os.path.join(args.input_folder, 'layer_*_expert_*')):
+            moe_model_state = torch.load(moe_model_state_file, map_location=torch.device('cpu'), weights_only=False)
+            for key, value in moe_model_state.items():
+                param_shapes = {}
+                param_shapes[key] = value.shape
                 slice_shapes.append(param_shapes)
 
         # fix back to normal flat dict, merge duplicates for tp>1
