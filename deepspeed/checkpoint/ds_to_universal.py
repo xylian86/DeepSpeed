@@ -17,6 +17,7 @@ import re
 import shutil
 import torch
 import tqdm
+import time
 #from pprint import pprint
 
 from deepspeed.checkpoint import DeepSpeedCheckpoint
@@ -496,10 +497,16 @@ def main(args):
         temp_dir = os.path.join(args.output_folder, 'tmp')
 
         print('*** 1. Extracting ZeRO fragments')
+        extract_start_time = time.time()
         _extract_zero_shard_files(args, ds_checkpoint, temp_dir)
+        extract_end_time = time.time()
+        print(f'[INFO] Extracting took {(extract_end_time - extract_start_time):.2f} s')
 
         print('*** 2. Merging slices .....')
+        merge_start_time = time.time()
         _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir)
+        merge_end_time = time.time()
+        print(f'[INFO] Merging took {(merge_end_time - merge_start_time):.2f} s')
 
         print('*** 3. Saving common optimizer states')
         _save_optimizer_state(args, ds_checkpoint)
@@ -520,10 +527,16 @@ def main(args):
         temp_dir = os.path.join(args.output_folder, 'tmp')
 
         print('*** 1. Extracting ZeRO fragments')
+        extract_start_time = time.time()
         _extract_zero_shard_files_stage3(args, optim_files, param_shapes, dp_degree, temp_dir)
+        extract_end_time = time.time()
+        print(f'[INFO] Extracting took {(extract_end_time - extract_start_time):.2f} s')
 
         print('*** 2. Merging slices .....')
+        merge_start_time = time.time()
         _merge_zero3_slice_files(args, param_shapes, dp_degree, temp_dir)
+        merge_end_time = time.time()
+        print(f'[INFO] Merging took {(merge_end_time - merge_start_time):.2f} s')
 
         print('*** 3. Saving common optimizer states')
         _save_optimizer_state_stage3(args, optim_files)
