@@ -403,9 +403,32 @@ def _extract_zero_shard_files_stage3(args, optim_files, param_shapes, dp_degree,
 
 
 def _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir):
+    comm = MPI.COMM_WORLD
+    comm.Barrier()
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    if rank == 0:
+        slice_shapes_items = list(slice_shapes.items())
+        chunk_size = len(slice_shapes_items) // size
+        remainder = len(slice_shapes_items) % size
+        start_idx = 0
+        for i in range(1, size):
+            proc_chunk_size = chunk_size + (1 if i < remainder else 0)
+            chunk = slice_shapes_items[start_idx:start_idx + proc_chunk_size]
+            comm.send(chunk, dest=i)
+            start_idx += proc_chunk_size
+        slice_shapes_items = slice_shapes_items[start_idx:]
+        print(f"Master process {rank} has {len(slice_shapes_items)} chunks to process")
+        print(f"Master process {rank} has {slice_shapes_items=}")
+    else:   
+        slice_shapes_items = comm.recv(source=0)
+        print(f"Process {rank} has {len(slice_shapes_items)} chunks to process")
+        print(f"Process {rank} has {slice_shapes_items=}")
+
     zero_output_folder = os.path.join(args.output_folder, "zero")
     do_work = partial(merge_tp_slices, ds_checkpoint, zero_output_folder, temp_dir, ds_checkpoint.tp_degree)
-    unmatched_patterns_lists = _do_parallel_work(do_work, list(slice_shapes.items()), args.num_merge_workers)
+    unmatched_patterns_lists = _do_parallel_work(do_work, slice_shapes_items, args.num_merge_workers)
 
     # verify that all patterns were used
     # if a pattern was not used by any of the workers, then it was not used at all -> assert/alert
