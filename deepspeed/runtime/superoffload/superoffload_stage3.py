@@ -17,6 +17,7 @@ from deepspeed.accelerator import get_accelerator
 
 OPTIMIZER_STEP_TIMER = 'optimizer_step'
 
+
 class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
 
     def __init__(
@@ -68,27 +69,17 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
         self._cur_bucket_index = -1
         self.async_cpuadam_num = 0
 
-        super().__init__(module, init_optimizer, timers, ds_config,
-                            static_loss_scale, dynamic_loss_scale,
-                            dynamic_loss_args, verbose,
-                            contiguous_gradients, reduce_bucket_size,
-                            prefetch_bucket_size, max_reuse_distance,
-                            max_live_parameters, param_persistence_threshold,
-                            model_persistence_threshold, dp_process_group,
-                            reduce_scatter, overlap_comm,
-                            offload_optimizer_config, offload_param_config,
-                            sub_group_size, offload_ratio, mpu, clip_grad,
-                            gradient_accumulation_dtype, communication_data_type,
-                            postscale_gradients, gradient_predivide_factor,
-                            gradient_accumulation_steps, elastic_checkpoint,
-                            aio_config, all2all_process_group,
-                            zero_hpz_partition_size, zero_quantized_weights,
-                            zero_quantized_nontrainable_weights,
-                            zero_module_granularity_threshold, zeropp_loco_param,
-                            log_trace_cache_warnings, enable_sanity_checks)
+        super().__init__(module, init_optimizer, timers, ds_config, static_loss_scale, dynamic_loss_scale,
+                         dynamic_loss_args, verbose, contiguous_gradients, reduce_bucket_size, prefetch_bucket_size,
+                         max_reuse_distance, max_live_parameters, param_persistence_threshold,
+                         model_persistence_threshold, dp_process_group, reduce_scatter, overlap_comm,
+                         offload_optimizer_config, offload_param_config, sub_group_size, offload_ratio, mpu, clip_grad,
+                         gradient_accumulation_dtype, communication_data_type, postscale_gradients,
+                         gradient_predivide_factor, gradient_accumulation_steps, elastic_checkpoint, aio_config,
+                         all2all_process_group, zero_hpz_partition_size, zero_quantized_weights,
+                         zero_quantized_nontrainable_weights, zero_module_granularity_threshold, zeropp_loco_param,
+                         log_trace_cache_warnings, enable_sanity_checks)
 
-
-        
         optimizer_config = {
             "lr": self.optimizer.param_groups[0]["lr"],
             "betas": self.optimizer.param_groups[0]["betas"],
@@ -96,10 +87,8 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
             "weight_decay": self.optimizer.param_groups[0]["weight_decay"],
             "amsgrad": self.optimizer.param_groups[0]["amsgrad"]
         }
-        self.superoffload_cpu_optimizer = SuperOffloadCPUOptimizer(
-            optimizer_config=optimizer_config,
-            cpuadam_cores_perc=cpuadam_cores_perc
-        )
+        self.superoffload_cpu_optimizer = SuperOffloadCPUOptimizer(optimizer_config=optimizer_config,
+                                                                   cpuadam_cores_perc=cpuadam_cores_perc)
 
     def _create_fp16_sub_groups(self, params_group):
 
@@ -112,7 +101,7 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
         sub_groups = []
         sub_group = []
         local_sub_group_size = 0
-        
+
         for param in params_group:
             sub_group.append(param)
             local_sub_group_size += param.partition_numel()
@@ -126,7 +115,6 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
                 local_sub_group_size = 0
 
         return sub_groups
-
 
     def _optimizer_step(self, sub_group_id):
         param_group_id = self.sub_group_to_group_id[sub_group_id]
@@ -149,16 +137,16 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
         comm_dtype = self.get_param_comm_dtype(param)
         bucket = self.ipg_buckets[comm_dtype]
         i, _, _ = self.grad_position[self.get_param_id(param)]
-        
+
         if len(bucket.params) == 0:
             self._cur_bucket_index = i
             if getattr(param, "ds_grad_is_ready", True):
                 self._DeepSpeedZeroOptimizer_Stage3__add_grad_to_ipg_bucket(param)
-            
+
             # If this is a single-parameter sub-group, reduce immediately
             if self.sub_group_to_param_num[self._cur_bucket_index] == 1:
                 self._DeepSpeedZeroOptimizer_Stage3__reduce_and_partition_ipg_grads(comm_dtype)
-                
+
         elif i != self._cur_bucket_index:
             # Parameter belongs to different sub-group, buffer it
             self.params_in_ipg_bucket_buffer.append(param)
@@ -166,11 +154,11 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
             # Parameter belongs to current bucket
             if getattr(param, "ds_grad_is_ready", True):
                 self._DeepSpeedZeroOptimizer_Stage3__add_grad_to_ipg_bucket(param)
-            
+
             # Check if bucket is complete
             if self.sub_group_to_param_num[self._cur_bucket_index] == len(bucket.params):
                 self._DeepSpeedZeroOptimizer_Stage3__reduce_and_partition_ipg_grads(comm_dtype)
-                
+
                 # Process buffered parameters
                 while self.params_in_ipg_bucket_buffer:
                     buffered_param = self.params_in_ipg_bucket_buffer.pop(0)
@@ -184,7 +172,7 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
         if self.subgroup_to_device[sub_group_id] == 'cpu':
             self._unflatten_partitioned_parameters(sub_group_id)
             return
-            
+
         if self.fp16_partitioned_groups_flat[sub_group_id] is not None:
             self.fp16_partitioned_groups_flat[sub_group_id].data.copy_(
                 self.fp32_partitioned_groups_flat[sub_group_id].data)
@@ -204,20 +192,20 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
         device_buffers = {}
         buffer_numel_min = {}
         buffer_numel_max = {}
-        
+
         for param, grad_partition in zip(params_to_release, grad_partitions):
             i, dest_offset, _ = self.grad_position[self.get_param_id(param)]
-            
+
             if self.is_gradient_accumulation_boundary:
                 self.norm_for_param_grads[self.get_param_id(param)] = self._constant_buffered_norm2(grad_partition)
-            
+
             buffer_numel = grad_partition.numel()
             buffers.append(grad_partition)
 
             if i not in device_buffers:
                 device_buffers[i] = []
             device_buffers[i].append(grad_partition)
-            
+
             if i not in buffer_numel_min:
                 buffer_numel_min[i] = dest_offset
                 buffer_numel_max[i] = dest_offset + buffer_numel
@@ -230,21 +218,23 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
                 fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
                     0, buffer_numel_min[i], buffer_numel_max[i] - buffer_numel_min[i])
                 concatenated_buffer = torch.cat(device_buffers[i], dim=0).float()
-                
+
                 if self.subgroup_to_device[i] == 'cpu':
                     # Trigger asynchronous CPU optimization
                     param_group_id = self.sub_group_to_group_id[i]
                     fp32_param = self.fp32_partitioned_groups_flat[i]
-                    
-                    self.superoffload_cpu_optimizer.async_step(param_group_id, i, fp32_param.data, concatenated_buffer.data)
+
+                    self.superoffload_cpu_optimizer.async_step(param_group_id, i, fp32_param.data,
+                                                               concatenated_buffer.data)
                     self.async_cpuadam_num += 1
-                    
+
                     # Check for completed async operations
                     result = self.superoffload_cpu_optimizer.get_result()
                     if result is not None:
-                        self._reassign_or_swap_out_partitioned_parameters_async(result["sub_group_id"], result["updated_param"])
+                        self._reassign_or_swap_out_partitioned_parameters_async(result["sub_group_id"],
+                                                                                result["updated_param"])
                         self.async_cpuadam_num -= 1
-                    
+
                     fp32_grad_tensor.copy_(concatenated_buffer, non_blocking=True)
                 else:
                     fp32_grad_tensor.copy_(concatenated_buffer, non_blocking=True)
@@ -254,7 +244,6 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
             if not get_accelerator().is_synchronized_device():
                 param.grad.record_stream(get_accelerator().current_stream())
             param.grad = None
-
 
     @instrument_w_nvtx
     def step(self, closure=None):
@@ -301,10 +290,9 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
         self.timers(OPTIMIZER_STEP_TIMER).stop()
         self._post_step(timer_names)
 
-
     def _wait_for_async_operations(self, timeout_seconds=60):
         """Wait for all pending asynchronous CPU optimizer operations to complete with timeout error.
-        
+
         Args:
             timeout_seconds (int): Maximum time to wait before throwing an error. Default is 60 seconds.
         """
@@ -312,50 +300,52 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
             logger.info(f"[INFO] {self.async_cpuadam_num} asynchronous CPU optimizer operations pending...")
         if self.async_cpuadam_num == 0:
             return
-            
+
         start_time = time.time()
         initial_pending_ops = self.async_cpuadam_num
-        
+
         while self.async_cpuadam_num > 0:
             result = self.superoffload_cpu_optimizer.get_result()
             if result is None:
                 current_time = time.time()
                 elapsed_time = current_time - start_time
-                
+
                 # Throw error if we've been waiting longer than the timeout
                 if elapsed_time >= timeout_seconds:
-                    raise RuntimeError(f"SuperOffload CPU optimizer timeout after {elapsed_time:.1f} seconds. "
-                                     f"Still waiting for {self.async_cpuadam_num}/{initial_pending_ops} async operations to complete. "
-                                     f"This indicates a deadlock or critical performance issue in the CPU optimizer.")
-                
+                    raise RuntimeError(
+                        f"SuperOffload CPU optimizer timeout after {elapsed_time:.1f} seconds. "
+                        f"Still waiting for {self.async_cpuadam_num}/{initial_pending_ops} async operations to complete. "
+                        f"This indicates a deadlock or critical performance issue in the CPU optimizer.")
+
                 time.sleep(0.001)  # 1ms sleep
                 continue
-                
+
             self._reassign_or_swap_out_partitioned_parameters_async(result["sub_group_id"], result["updated_param"])
             self.async_cpuadam_num -= 1
 
     def _wait_for_single_async_result(self, timeout_seconds=60):
         """Wait for a single asynchronous CPU-Adam optimizer operation with timeout.
-        
+
         Args:
             timeout_seconds (int): Maximum time to wait before throwing an error. Default is 60 seconds.
         """
         start_time = time.time()
-        
+
         while True:
             result = self.superoffload_cpu_optimizer.get_result()
             if result is not None:
-                self._reassign_or_swap_out_partitioned_parameters_async(result["sub_group_id"], result["updated_param"])
+                self._reassign_or_swap_out_partitioned_parameters_async(result["sub_group_id"],
+                                                                        result["updated_param"])
                 break
-            
+
             current_time = time.time()
             elapsed_time = current_time - start_time
-            
+
             # Throw error if we've been waiting longer than the timeout
             if elapsed_time >= timeout_seconds:
                 raise RuntimeError(f"SuperOffload CPU optimizer timeout after {elapsed_time:.1f} seconds. "
-                                 f"This indicates a deadlock or critical performance issue in the CPU optimizer.")
-            
+                                   f"This indicates a deadlock or critical performance issue in the CPU optimizer.")
+
             time.sleep(0.001)  # 1ms sleep
 
     def _handle_overflow_rollback(self):
@@ -364,11 +354,14 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
             if self.subgroup_to_device[sub_group_id] == 'cpu':
                 param_group_id = self.sub_group_to_group_id[sub_group_id]
                 fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
-                
+
                 # Trigger rollback
-                self.superoffload_cpu_optimizer.async_step(
-                    param_group_id, sub_group_id, fp32_param.data, fp32_param.grad.data, rollback=True)
-                
+                self.superoffload_cpu_optimizer.async_step(param_group_id,
+                                                           sub_group_id,
+                                                           fp32_param.data,
+                                                           fp32_param.grad.data,
+                                                           rollback=True)
+
                 # Wait for rollback completion
                 self._wait_for_single_async_result()
 
@@ -378,18 +371,22 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
             if self.subgroup_to_device[sub_group_id] == 'cpu':
                 param_group_id = self.sub_group_to_group_id[sub_group_id]
                 fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
-                
+
                 # Rollback CPU optimizer states
-                self.superoffload_cpu_optimizer.async_step(
-                    param_group_id, sub_group_id, fp32_param.data, fp32_param.grad.data, rollback=True)
-                
+                self.superoffload_cpu_optimizer.async_step(param_group_id,
+                                                           sub_group_id,
+                                                           fp32_param.data,
+                                                           fp32_param.grad.data,
+                                                           rollback=True)
+
                 # Wait for rollback completion
                 self._wait_for_single_async_result()
-                
+
                 # Clip gradients and re-optimize
                 self.unscale_and_clip_grads(sub_group_id, scaled_global_grad_norm)
-                self.superoffload_cpu_optimizer.async_step(param_group_id, sub_group_id, fp32_param.data, fp32_param.grad.data)
-                
+                self.superoffload_cpu_optimizer.async_step(param_group_id, sub_group_id, fp32_param.data,
+                                                           fp32_param.grad.data)
+
                 # Wait for re-optimization completion
                 self._wait_for_single_async_result()
 

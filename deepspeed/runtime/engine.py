@@ -1833,7 +1833,8 @@ class DeepSpeedEngine(Module):
                 log_dist(f'Creating {model_dtype} ZeRO stage {zero_stage} optimizer', ranks=[0])
                 from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
                 from deepspeed.runtime.superoffload.superoffload_stage3 import SuperOffloadOptimizer_Stage3
-                Stage3ZeroOptimizer = DeepSpeedZeroOptimizer_Stage3 if not self.super_offload() else SuperOffloadOptimizer_Stage3
+                Stage3ZeroOptimizer = DeepSpeedZeroOptimizer_Stage3 if not self.super_offload(
+                ) else SuperOffloadOptimizer_Stage3
                 optimizer = Stage3ZeroOptimizer(
                     self.module,
                     optimizer,

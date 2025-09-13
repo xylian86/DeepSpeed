@@ -181,7 +181,7 @@ class DeepSpeedCPUAdam(torch.optim.Optimizer):
 
                 if p.grad is None:
                     continue
-                
+
                 assert p.device == device, f"CPUAdam param is on {p.device} and must be 'cpu', make " \
                         "sure you enabled 'offload_optimizer': 'cpu' in your ZeRO config."
 
@@ -214,20 +214,18 @@ class DeepSpeedCPUAdam(torch.optim.Optimizer):
 
         # Intended device for step
         device = torch.device('cpu')
-        
+
         # Validate subgroup state exists and is initialized
         if sub_group_id not in self.state or len(self.state[sub_group_id]) == 0:
-            raise RuntimeError(
-                f"Cannot rollback optimizer state for sub_group_id {sub_group_id} "
-                f"as it has not been initialized.")
-        
+            raise RuntimeError(f"Cannot rollback optimizer state for sub_group_id {sub_group_id} "
+                               f"as it has not been initialized.")
+
         subgroup_state = self.state[sub_group_id]
-        
+
         # Check if we can rollback (step count must be > 0)
         if subgroup_state.get('step', 0) <= 0:
-            raise RuntimeError(
-                f"Cannot rollback sub_group_id {sub_group_id}: "
-                f"step count is {subgroup_state.get('step', 0)}")
+            raise RuntimeError(f"Cannot rollback sub_group_id {sub_group_id}: "
+                               f"step count is {subgroup_state.get('step', 0)}")
 
         for _, group in enumerate(self.param_groups):
             for _, param in enumerate(group['params']):
@@ -240,22 +238,12 @@ class DeepSpeedCPUAdam(torch.optim.Optimizer):
 
                 # Decrement step count
                 subgroup_state['step'] -= 1
-                
+
                 # Extract hyperparameters
                 beta1, beta2 = group['betas']
-                
-                self.ds_opt_adam.adam_rollback(
-                    self.opt_id, 
-                    subgroup_state['step'], 
-                    group['lr'], 
-                    beta1, 
-                    beta2, 
-                    group['eps'],
-                    group['weight_decay'], 
-                    group['bias_correction'], 
-                    param.data, 
-                    param.grad.data,
-                    subgroup_state['exp_avg'], 
-                    subgroup_state['exp_avg_sq']
-                )
+
+                self.ds_opt_adam.adam_rollback(self.opt_id, subgroup_state['step'], group['lr'], beta1, beta2,
+                                               group['eps'], group['weight_decay'], group['bias_correction'],
+                                               param.data, param.grad.data, subgroup_state['exp_avg'],
+                                               subgroup_state['exp_avg_sq'])
         return loss

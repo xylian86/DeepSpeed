@@ -236,17 +236,17 @@ int ds_adam_step(int optimizer_id,
     return 0;
 }
 
-void adamw_rollback_inplace(float* params, 
-                            const float* grads, 
-                            float* momentum, 
-                            float* variance, 
+void adamw_rollback_inplace(float* params,
+                            const float* grads,
+                            float* momentum,
+                            float* variance,
                             size_t param_size,
-                            float learning_rate, 
-                            float beta1, 
-                            float beta2, 
-                            float eps, 
-                            float weight_decay, 
-                            int& step_count) 
+                            float learning_rate,
+                            float beta1,
+                            float beta2,
+                            float eps,
+                            float weight_decay,
+                            int& step_count)
 {
     const float lr = learning_rate;
     const float lambda = weight_decay;
@@ -264,7 +264,7 @@ void adamw_rollback_inplace(float* params,
 
         const float m_hat = momentum[i] / bias_correction1;
         const float v_hat = variance[i] / bias_correction2;
-        
+
         const float denominator = std::sqrt(v_hat) + eps;
 
         // Rollback parameter update
@@ -272,9 +272,7 @@ void adamw_rollback_inplace(float* params,
         float new_param = (params[i] + update) / one_minus_lr_lambda;
 
         // Handle numerical instability
-        if (!std::isfinite(new_param)) {
-            new_param = 0.0f;
-        }
+        if (!std::isfinite(new_param)) { new_param = 0.0f; }
 
         params[i] = new_param;
 
@@ -282,7 +280,7 @@ void adamw_rollback_inplace(float* params,
         momentum[i] = (momentum[i] - one_minus_beta1 * grad) / beta1;
         variance[i] = (variance[i] - one_minus_beta2 * grad * grad) / beta2;
     }
-    
+
     --step_count;
 }
 
@@ -301,8 +299,7 @@ int ds_adam_rollback(int optimizer_id,
 {
     try {
         // Validate tensor types - rollback currently only supports float32
-        if (params.scalar_type() != torch::kFloat32 ||
-            grads.scalar_type() != torch::kFloat32 ||
+        if (params.scalar_type() != torch::kFloat32 || grads.scalar_type() != torch::kFloat32 ||
             exp_avg.scalar_type() != torch::kFloat32 ||
             exp_avg_sq.scalar_type() != torch::kFloat32) {
             printf("Error: Adam rollback currently only supports float32 tensors\n");
@@ -316,8 +313,17 @@ int ds_adam_rollback(int optimizer_id,
         const size_t param_size = params.numel();
         int step_count = static_cast<int>(step);
 
-        adamw_rollback_inplace(params_ptr, grads_ptr, momentum_ptr, variance_ptr, 
-                              param_size, lr, beta1, beta2, epsilon, weight_decay, step_count);
+        adamw_rollback_inplace(params_ptr,
+                               grads_ptr,
+                               momentum_ptr,
+                               variance_ptr,
+                               param_size,
+                               lr,
+                               beta1,
+                               beta2,
+                               epsilon,
+                               weight_decay,
+                               step_count);
 
         return 0;
     } catch (const std::exception& e) {
