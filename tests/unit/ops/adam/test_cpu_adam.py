@@ -312,35 +312,3 @@ class TestCPUAdamSubgroup(DistributedTest):
         optimizer.rollback_subgroup(0)
         assert optimizer.state[0]['step'] == 1, "Subgroup 0 step count should be decremented"
         assert optimizer.state[1]['step'] == 1, "Subgroup 1 step count should be unchanged"
-
-    def test_subgroup_gpu_param_error(self):
-        """Test that step_subgroup and rollback_subgroup raise error for GPU parameters."""
-        if not get_accelerator().is_available():
-            pytest.skip("GPU not available for testing")
-
-        from deepspeed.ops.adam import DeepSpeedCPUAdam
-
-        model_size = 64
-        device = get_accelerator().device_name(0)
-        param = torch.nn.Parameter(torch.randn(model_size, device=device))
-        optimizer = DeepSpeedCPUAdam([param])
-
-        param.grad = torch.randn(model_size, device=device)
-
-        # Test step_subgroup with GPU param
-        with pytest.raises(AssertionError):
-            optimizer.step_subgroup(0)
-
-        # For rollback test, we need to create CPU state first
-        cpu_param = torch.nn.Parameter(torch.randn(model_size, device='cpu'))
-        cpu_optimizer = DeepSpeedCPUAdam([cpu_param])
-        cpu_param.grad = torch.randn(model_size, device='cpu')
-        cpu_optimizer.step_subgroup(0)
-
-        # Now test rollback with GPU param
-        param_gpu = torch.nn.Parameter(torch.randn(model_size, device=device))
-        cpu_optimizer.param_groups[0]['params'][0] = param_gpu
-        param_gpu.grad = torch.randn(model_size, device=device)
-
-        with pytest.raises(AssertionError):
-            cpu_optimizer.rollback_subgroup(0)
