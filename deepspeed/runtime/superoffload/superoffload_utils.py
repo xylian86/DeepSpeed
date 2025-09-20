@@ -82,10 +82,12 @@ def superoffload_optimizer_worker(param_queue: mp.SimpleQueue, result_queue: mp.
                 optimizer.step_subgroup(sub_group_id)
 
             # Send result back to main process
+            event_type = 'rollback' if rollback else 'adam_step'
             result_queue.put({
                 'param_group_id': param_group_id,
                 'sub_group_id': sub_group_id,
                 'updated_param': fp32_param.data,
+                'event_type': event_type,
             })
 
             # Clean up references to free memory
@@ -177,9 +179,13 @@ class SuperOffloadCPUOptimizer:
             'rollback': rollback,
         })
 
-    def get_result(self) -> Optional[Dict[str, Any]]:
+    def get_result(self, expected_event_type: str = None) -> Optional[Dict[str, Any]]:
         """
-        Get result from worker process.
+        Get result from worker process with optional event type validation.
+
+        Args:
+            expected_event_type (str, optional): Expected event type ('adam_step' or 'rollback').
+                                                If provided, validates that the result matches.
         """
         if self.result_queue.empty():
             return None
@@ -188,6 +194,12 @@ class SuperOffloadCPUOptimizer:
 
         if 'error' in result:
             raise RuntimeError(f"Error in worker process: {result['error']}")
+
+        # Validate event type if expected_event_type is provided
+        if expected_event_type is not None:
+            result_event_type = result.get('event_type')
+            if result_event_type != expected_event_type:
+                raise RuntimeError(f"Event type mismatch: expected '{expected_event_type}', got '{result_event_type}'")
 
         return result
 

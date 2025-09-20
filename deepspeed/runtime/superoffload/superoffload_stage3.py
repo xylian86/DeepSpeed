@@ -323,16 +323,17 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
             self._reassign_or_swap_out_partitioned_parameters_async(result["sub_group_id"], result["updated_param"])
             self.async_cpuadam_num -= 1
 
-    def _wait_for_single_async_result(self, timeout_seconds=60):
+    def _wait_for_single_async_result(self, event_type: str, timeout_seconds=60):
         """Wait for a single asynchronous CPU-Adam optimizer operation with timeout.
 
         Args:
+            event_type (str): Type of operation expected ('adam_step' or 'rollback').
             timeout_seconds (int): Maximum time to wait before throwing an error. Default is 60 seconds.
         """
         start_time = time.time()
 
         while True:
-            result = self.superoffload_cpu_optimizer.get_result()
+            result = self.superoffload_cpu_optimizer.get_result(expected_event_type=event_type)
             if result is not None:
                 self._reassign_or_swap_out_partitioned_parameters_async(result["sub_group_id"],
                                                                         result["updated_param"])
@@ -363,7 +364,7 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
                                                            rollback=True)
 
                 # Wait for rollback completion
-                self._wait_for_single_async_result()
+                self._wait_for_single_async_result("rollback")
 
     def _handle_gradient_clipping(self, scaled_global_grad_norm):
         """Handle gradient clipping with CPU optimizer rollback and re-optimization."""
@@ -380,7 +381,7 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
                                                            rollback=True)
 
                 # Wait for rollback completion
-                self._wait_for_single_async_result()
+                self._wait_for_single_async_result("rollback")
 
                 # Clip gradients and re-optimize
                 self.unscale_and_clip_grads(sub_group_id, scaled_global_grad_norm)
@@ -388,7 +389,7 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
                                                            fp32_param.grad.data)
 
                 # Wait for re-optimization completion
-                self._wait_for_single_async_result()
+                self._wait_for_single_async_result("adam_step")
 
     @instrument_w_nvtx
     def check_clip_grads(self, total_norm):
