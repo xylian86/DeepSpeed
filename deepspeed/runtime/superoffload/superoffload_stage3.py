@@ -349,6 +349,22 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
 
             time.sleep(0.001)  # 1ms sleep
 
+    def _sync_cpu_optimizer_step(self,
+                                 param_group_id: int,
+                                 sub_group_id: int,
+                                 fp32_param_data,
+                                 fp32_grad_data,
+                                 rollback: bool = False,
+                                 timeout_seconds: int = 60):
+        event_type = "rollback" if rollback else "adam_step"
+        self.superoffload_cpu_optimizer.async_step(param_group_id,
+                                                   sub_group_id,
+                                                   fp32_param_data,
+                                                   fp32_grad_data,
+                                                   rollback=rollback)
+        # Wait for completion
+        self._wait_for_single_async_result(event_type, timeout_seconds)
+
     def _handle_overflow_rollback(self):
         """Handle gradient overflow by rolling back CPU optimizer states."""
         for sub_group_id, _ in enumerate(self.fp16_groups):
@@ -357,14 +373,11 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
                 fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
 
                 # Trigger rollback
-                self.superoffload_cpu_optimizer.async_step(param_group_id,
-                                                           sub_group_id,
-                                                           fp32_param.data,
-                                                           fp32_param.grad.data,
-                                                           rollback=True)
-
-                # Wait for rollback completion
-                self._wait_for_single_async_result("rollback")
+                self._sync_cpu_optimizer_step(param_group_id,
+                                              sub_group_id,
+                                              fp32_param.data,
+                                              fp32_param.grad.data,
+                                              rollback=True)
 
     def _handle_gradient_clipping(self, scaled_global_grad_norm):
         """Handle gradient clipping with CPU optimizer rollback and re-optimization."""
@@ -374,22 +387,20 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
                 fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
 
                 # Rollback CPU optimizer states
-                self.superoffload_cpu_optimizer.async_step(param_group_id,
-                                                           sub_group_id,
-                                                           fp32_param.data,
-                                                           fp32_param.grad.data,
-                                                           rollback=True)
-
-                # Wait for rollback completion
-                self._wait_for_single_async_result("rollback")
+                self._sync_cpu_optimizer_step(param_group_id,
+                                              sub_group_id,
+                                              fp32_param.data,
+                                              fp32_param.grad.data,
+                                              rollback=True)
 
                 # Clip gradients and re-optimize
                 self.unscale_and_clip_grads(sub_group_id, scaled_global_grad_norm)
-                self.superoffload_cpu_optimizer.async_step(param_group_id, sub_group_id, fp32_param.data,
-                                                           fp32_param.grad.data)
 
-                # Wait for re-optimization completion
-                self._wait_for_single_async_result("adam_step")
+                self._sync_cpu_optimizer_step(param_group_id,
+                                              sub_group_id,
+                                              fp32_param.data,
+                                              fp32_param.grad.data,
+                                              rollback=False)
 
     @instrument_w_nvtx
     def check_clip_grads(self, total_norm):
