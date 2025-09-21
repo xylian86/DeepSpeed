@@ -68,6 +68,7 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
         self.params_in_ipg_bucket_buffer = []
         self._cur_bucket_index = -1
         self.async_cpuadam_num = 0
+        self.max_grad_numel = 0
 
         super().__init__(module, init_optimizer, timers, ds_config, static_loss_scale, dynamic_loss_scale,
                          dynamic_loss_args, verbose, contiguous_gradients, reduce_bucket_size, prefetch_bucket_size,
@@ -88,7 +89,8 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
             "amsgrad": self.optimizer.param_groups[0]["amsgrad"]
         }
         self.superoffload_cpu_optimizer = SuperOffloadCPUOptimizer(optimizer_config=optimizer_config,
-                                                                   cpuadam_cores_perc=cpuadam_cores_perc)
+                                                                   cpuadam_cores_perc=cpuadam_cores_perc,
+                                                                   max_grad_numel=self.max_grad_numel)
 
     def _create_fp16_sub_groups(self, params_group):
 
@@ -107,7 +109,7 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
             local_sub_group_size += param.partition_numel()
 
             if local_sub_group_size >= sub_group_size or id(param) == id(params_group[-1]):
-
+                self.max_grad_numel = max(self.max_grad_numel, local_sub_group_size)
                 sub_groups.append(sub_group)
                 self.sub_group_to_param_num[len(sub_groups) - 1] = len(sub_group)
 
