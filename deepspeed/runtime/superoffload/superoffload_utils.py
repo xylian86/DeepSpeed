@@ -16,6 +16,24 @@ from deepspeed.ops.adam import DeepSpeedCPUAdam
 from deepspeed.utils import logger
 
 
+class TaskKeys:
+    PARAM_DATA = "param_data"
+    PARAM_GRAD = "param_grad"
+    PARAM_GROUP_ID = "param_group_id"
+    SUB_GROUP_ID = "sub_group_id"
+    ROLLBACK = "rollback"
+
+
+class ResultKeys:
+    UPDATED_PARAM = "updated_param"
+    EVENT_TYPE = "event_type"
+
+
+class EventTypes:
+    ADAM_STEP = "adam_step"
+    ROLLBACK = "rollback"
+
+
 def superoffload_optimizer_worker(param_queue: mp.SimpleQueue, result_queue: mp.SimpleQueue,
                                   optimizer_config: Dict[str, Any], max_grad_numel: int) -> None:
     """
@@ -44,7 +62,7 @@ def superoffload_optimizer_worker(param_queue: mp.SimpleQueue, result_queue: mp.
     except KeyError as e:
         error_msg = f"Missing required optimizer config key: {e}"
         logger.error(error_msg)
-        result_queue.put({'error': error_msg})
+        result_queue.put({"error": error_msg})
         return
 
     # Pre-allocate reusable pinned memory buffer for gradients
@@ -58,16 +76,16 @@ def superoffload_optimizer_worker(param_queue: mp.SimpleQueue, result_queue: mp.
                 logger.debug("Received termination signal, shutting down worker")
                 break
 
-            param_data = task['param_data']
-            param_grad = task['param_grad']
-            param_group_id = task['param_group_id']
-            sub_group_id = task['sub_group_id']
-            rollback = task.get('rollback', False)
+            param_data = task[TaskKeys.PARAM_DATA]
+            param_grad = task[TaskKeys.PARAM_GRAD]
+            param_group_id = task[TaskKeys.PARAM_GROUP_ID]
+            sub_group_id = task[TaskKeys.SUB_GROUP_ID]
+            rollback = task.get(TaskKeys.ROLLBACK, False)
 
             logger.debug(f"Processing param_group_id: {param_group_id}, sub_group_id: {sub_group_id}")
 
-            del task['param_data']
-            del task['param_grad']
+            del task[TaskKeys.PARAM_DATA]
+            del task[TaskKeys.PARAM_GRAD]
             task.clear()
 
             grad_numel = param_grad.numel()
@@ -75,7 +93,7 @@ def superoffload_optimizer_worker(param_queue: mp.SimpleQueue, result_queue: mp.
                 error_msg = (
                     f"Gradient size {grad_numel} exceeds pre-allocated buffer size {max_grad_numel}. "
                     f"This indicates insufficient buffer allocation. Please increase max_grad_numel parameter.")
-                result_queue.put({'error': error_msg})
+                result_queue.put({"error": error_msg})
                 break
 
             param_grad_cpu = pinned_grad_buffer[:grad_numel].view_as(param_grad)
@@ -93,12 +111,12 @@ def superoffload_optimizer_worker(param_queue: mp.SimpleQueue, result_queue: mp.
                 optimizer.step_subgroup(sub_group_id)
 
             # Send result back to main process
-            event_type = 'rollback' if rollback else 'adam_step'
+            event_type = EventTypes.ROLLBACK if rollback else EventTypes.ADAM_STEP
             result_queue.put({
-                'param_group_id': param_group_id,
-                'sub_group_id': sub_group_id,
-                'updated_param': fp32_param.data,
-                'event_type': event_type,
+                TaskKeys.PARAM_GROUP_ID: param_group_id,
+                TaskKeys.SUB_GROUP_ID: sub_group_id,
+                ResultKeys.UPDATED_PARAM: fp32_param.data,
+                ResultKeys.EVENT_TYPE: event_type,
             })
 
             # Clean up references to free memory
@@ -108,12 +126,12 @@ def superoffload_optimizer_worker(param_queue: mp.SimpleQueue, result_queue: mp.
         except KeyError as e:
             error_msg = f"Missing required task key: {e}"
             logger.error(error_msg)
-            result_queue.put({'error': error_msg})
+            result_queue.put({"error": error_msg})
             break
         except Exception as e:
             error_msg = f"Unexpected error in worker process: {e}"
             logger.error(error_msg)
-            result_queue.put({'error': error_msg})
+            result_queue.put({"error": error_msg})
             break
 
     # Clean up pinned memory buffer
@@ -192,11 +210,11 @@ class SuperOffloadCPUOptimizer:
             raise RuntimeError("Worker process is not alive")
 
         self.param_queue.put({
-            'param_data': fp32_param,
-            'param_grad': fp32_grad,
-            'param_group_id': param_group_id,
-            'sub_group_id': sub_group_id,
-            'rollback': rollback,
+            TaskKeys.PARAM_DATA: fp32_param,
+            TaskKeys.PARAM_GRAD: fp32_grad,
+            TaskKeys.PARAM_GROUP_ID: param_group_id,
+            TaskKeys.SUB_GROUP_ID: sub_group_id,
+            TaskKeys.ROLLBACK: rollback,
         })
 
     def get_result(self, expected_event_type: str = None) -> Optional[Dict[str, Any]]:
@@ -212,12 +230,12 @@ class SuperOffloadCPUOptimizer:
 
         result = self.result_queue.get()
 
-        if 'error' in result:
+        if "error" in result:
             raise RuntimeError(f"Error in worker process: {result['error']}")
 
         # Validate event type if expected_event_type is provided
         if expected_event_type is not None:
-            result_event_type = result.get('event_type')
+            result_event_type = result.get(ResultKeys.EVENT_TYPE)
             if result_event_type != expected_event_type:
                 raise RuntimeError(f"Event type mismatch: expected '{expected_event_type}', got '{result_event_type}'")
 

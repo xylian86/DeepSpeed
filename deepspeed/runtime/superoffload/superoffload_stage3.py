@@ -8,7 +8,7 @@ import time
 import torch
 from typing import List
 
-from deepspeed.runtime.superoffload.superoffload_utils import SuperOffloadCPUOptimizer
+from deepspeed.runtime.superoffload.superoffload_utils import SuperOffloadCPUOptimizer, TaskKeys, ResultKeys, EventTypes
 from deepspeed.runtime.zero.partition_parameters import Parameter, Tensor
 from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
 from deepspeed.utils.nvtx import instrument_w_nvtx
@@ -233,8 +233,8 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
                     # Check for completed async operations
                     result = self.superoffload_cpu_optimizer.get_result()
                     if result is not None:
-                        self._reassign_or_swap_out_partitioned_parameters_async(result["sub_group_id"],
-                                                                                result["updated_param"])
+                        self._reassign_or_swap_out_partitioned_parameters_async(result[TaskKeys.SUB_GROUP_ID],
+                                                                                result[ResultKeys.UPDATED_PARAM])
                         self.async_cpuadam_num -= 1
 
                     fp32_grad_tensor.copy_(concatenated_buffer, non_blocking=True)
@@ -322,7 +322,8 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
                 time.sleep(0.001)  # 1ms sleep
                 continue
 
-            self._reassign_or_swap_out_partitioned_parameters_async(result["sub_group_id"], result["updated_param"])
+            self._reassign_or_swap_out_partitioned_parameters_async(result[TaskKeys.SUB_GROUP_ID],
+                                                                    result[ResultKeys.UPDATED_PARAM])
             self.async_cpuadam_num -= 1
 
     def _wait_for_single_async_result(self, event_type: str, timeout_seconds=60):
@@ -337,8 +338,8 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
         while True:
             result = self.superoffload_cpu_optimizer.get_result(expected_event_type=event_type)
             if result is not None:
-                self._reassign_or_swap_out_partitioned_parameters_async(result["sub_group_id"],
-                                                                        result["updated_param"])
+                self._reassign_or_swap_out_partitioned_parameters_async(result[TaskKeys.SUB_GROUP_ID],
+                                                                        result[ResultKeys.UPDATED_PARAM])
                 break
 
             current_time = time.time()
@@ -358,7 +359,7 @@ class SuperOffloadOptimizer_Stage3(DeepSpeedZeroOptimizer_Stage3):
                                  fp32_grad_data,
                                  rollback: bool = False,
                                  timeout_seconds: int = 60):
-        event_type = "rollback" if rollback else "adam_step"
+        event_type = EventTypes.ROLLBACK if rollback else EventTypes.ADAM_STEP
         self.superoffload_cpu_optimizer.async_step(param_group_id,
                                                    sub_group_id,
                                                    fp32_param_data,
