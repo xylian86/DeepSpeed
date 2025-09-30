@@ -9,10 +9,9 @@
 
 ---
 
-## Table of Content
+## Table of Content <!-- omit in toc -->
 
 - [SuperOffload: Unleashing the Power of Large-Scale LLM Training on Superchips](#superoffload-unleashing-the-power-of-large-scale-llm-training-on-superchips)
-  - [Table of Content](#table-of-content)
   - [SuperOffload Highlights](#superoffload-highlights)
   - [Introduction](#introduction)
   - [How SuperOffload Works](#how-superoffload-works)
@@ -21,9 +20,10 @@
     - [3. Superchip-Aware Casting](#3-superchip-aware-casting)
     - [4. GraceAdam for Optimizer Efficiency](#4-graceadam-for-optimizer-efficiency)
   - [Experience and Insights](#experience-and-insights)
-  - [Easy-to-Use](#easy-to-use)
+  - [Getting Started](#getting-started)
   - [Acknowledgements](#acknowledgements)
-  - [BibTeX](#bibtex)
+
+---
 
 ## SuperOffload Highlights
 
@@ -39,7 +39,7 @@
 
 The emergence of tightly coupled heterogeneous GPU/CPU architectures (a.k.a., Superchips), such as NVIDIA GH200, GB200, and AMD MI300A, offers new optimization opportunities for large-scale AI. Yet it remains under-explored in terms of how to make the best use of these new hardware for large-scale LLM training. Existing offloading solutions were designed for traditional loosely coupled architectures, and are suboptimal on Superchips suffering high overheads and low GPU utilization. To address this gap and to make the best use of Superchips for efficient LLM training, we have developed and open-sourced **SuperOffload**.
 
-SuperOffload introduces a set of novel techniques that make the best use of Hopper GPU, Grace CPU, and NVLink-C2C, simultaneously for LLM training. Unlike prior offloading solutions which assume slow GPU-CPU interconnects (e.g., 64GB/sec for PCIe-Gen4), SuperOffload exploits the much faster interconnects (e.g., 900GB/sec for NVLink-C2C) to boost GPU and CPU utilization, and training throughput. With SuperOffload, models such as **GPT-OSS-20B**, **Qwen3-14B**, and **Phi-4** can be fully fine-tuned on a single GH200, delivering **up to 600 TFLOPS** training throughput under modest settings (sequence length 4k, batch size 4). This delivers up to **4×** higher throughput compared to prior work such as ZeRO-Offload. SuperOffload enables scaling to even larger models, including Qwen3-30B-A3B and Seed-OSS-36B on two GH200s and Llama-70B on four GH200s.
+SuperOffload introduces a set of novel techniques that make the best use of Hopper GPU, Grace CPU, and NVLink-C2C, simultaneously for LLM training. Unlike prior offloading solutions which assume slow GPU-CPU interconnects (e.g., 64GB/sec for PCIe-Gen4), SuperOffload exploits the much faster interconnects (e.g., 900GB/sec for NVLink-C2C) to boost GPU and CPU utilization, and training throughput. With SuperOffload, models such as **GPT-OSS-20B**, **Qwen3-14B**, and **Phi-4** can be fully fine-tuned on a single GH200, delivering up to **600 TFLOPS** training throughput under modest settings (sequence length 4k, batch size 4). This delivers up to **4×** higher throughput compared to prior work such as ZeRO-Offload. SuperOffload enables scaling to even larger models, including Qwen3-30B-A3B and Seed-OSS-36B on two GH200s and Llama-70B on four GH200s.
 
 SuperOffload is built on top of DeepSpeed ZeRO Stage 3, and available in DeepSpeed versions >= [0.18.0](https://github.com/deepspeedai/DeepSpeed/releases/tag/v0.18.0). To enable easy integration into LLM finetuning pipelines, SuperOffload is compatible with Hugging Face Transformers and does not require any changes to modeling code.
 
@@ -50,7 +50,7 @@ The open-source release of **SuperOffload** addresses this gap by providing a se
 <!-- Built on top of ZeRO Stage 3, SuperOffload enables scaling to even larger models, including Qwen3-30B-A3B, Seed-OSS-36B on two GH200s and Llama-70B on four GH200s. All of this is supported natively through Hugging Face Transformers and DeepSpeed, with no need for changes to modeling code. -->
 
 <div align="center">
-<img src="./images/superoffload_comparision.jpg" alt="SuperOffload system overview" width="80%">
+<img src="./images/superoffload_comparision.jpg" alt="SuperOffload system overview" width="90%">
 <p align="center"><em>Figure 1: SuperOffload delivers up to 4× higher throughput than ZeRO-Offload for large-model fine-tuning across varying sequence lengths and batch sizes, achieving up to 600 TFLOPS throughput.</em></p>
 </div>
 
@@ -168,7 +168,7 @@ Existing offloading solutions for LLM training require CPU implementations of th
 
 ---
 
-## Easy-to-Use
+## Getting Started
 
 End-to-end finetuning examples using SuperOffload are available in our tutorial/readme: [DeepSpeedExamples: SuperOffload](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/training/DeepSpeed-SuperOffload#readme). To enable SuperOffload quickly, add the following switch to your DeepSpeed config (see tutorial for full context):
 
@@ -199,7 +199,7 @@ Community feedback and contributions are welcome. For enablement and examples, s
 
 ---
 
-## BibTeX
+## BibTeX  <!-- omit in toc -->
 
 ```bibtex
 @inproceedings{superoffload,
