@@ -138,7 +138,7 @@ class AsyncPartitionedParameterSwapper(object):
             assert numel is None, "Both parma and numel cannot be provided"
             numel = param.ds_tensor.ds_numel
         if numel is not None:
-            return self.min_aio_bytes <= numel * self.swap_element_size
+            return self.min_aio_bytes <= numel * self.swap_element_size and numel <= self.elements_per_buffer
         assert False, "Either param or numel must be provided"
 
     def get_path(self, param, must_exist=False):

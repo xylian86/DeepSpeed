@@ -160,10 +160,15 @@ class DeepSpeedZeRoOffload(object):
             self._set_z3_leaf_modules_by_threshold(module, zero_module_granularity_threshold)
             self.fast_sharding_for_leaf_module = True
 
+        cpu_buffer_pool_size = 100
+        cpu_buffer_size = int(6*1e7)
+        
         self.param_coordinator = PartitionedParameterCoordinator(
             prefetch_bucket_sz=self._prefetch_bucket_sz,
             max_reuse_distance_in_numel=self._max_reuse_distance_in_numel,
             max_available_parameters_in_numel=self._max_available_parameters_in_numel,
+            cpu_buffer_pool_size=cpu_buffer_pool_size,
+            cpu_buffer_size=cpu_buffer_size,
             allgather_stream=self.__allgather_stream,
             inflight_param_registry=self.__inflight_param_registry,
             prefetch_nvme=self.offload_device == OffloadDeviceEnum.nvme,

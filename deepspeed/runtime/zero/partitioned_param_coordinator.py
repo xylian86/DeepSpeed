@@ -89,6 +89,8 @@ class PartitionedParameterCoordinator:
         zero_quantized_nontrainable_weights=False,
         fast_sharding_for_leaf_module=False,
         log_trace_cache_warnings=False,
+        cpu_buffer_pool_size: int = 10,
+        cpu_buffer_size: int = 100000000,
     ) -> None:
         # mapping of param -> handle for each param that is currently in flight
         self.__inflight_param_registry = inflight_param_registry
@@ -106,6 +108,16 @@ class PartitionedParameterCoordinator:
         self.__max_n_available_params: int = max_available_parameters_in_numel
         # max distance between two use of the module beyond which module is released
         self.__max_reuse_dist_in_numel: int = max_reuse_distance_in_numel
+        # CPU cache for parameters with pinned buffer reuse
+        self.__cpu_cache: dict = {}  # param_id -> (buffer_id, dtype, shape, last_used_step)
+        self.__cpu_cache_order = collections.deque()  # track order for stats
+        self.__cpu_buffer_pool: dict = {}  # buffer_id -> (tensor, in_use)
+        self.__buffer_counter: int = 0
+        self.__cpu_buffer_size: int = cpu_buffer_size
+        
+        # Pre-allocate CPU buffer pool if enabled
+        if cpu_buffer_pool_size > 0:
+            self._pre_allocate_cpu_buffers(cpu_buffer_pool_size, cpu_buffer_size)
         # queue for parameters to fetch. parameters will be popped off the left
         # side of the dequeue as they are fetched
         self.__param_queue: Deque[__class__.__ParamInTrace] = None
@@ -249,6 +261,8 @@ class PartitionedParameterCoordinator:
                 print_rank_0(
                     f"completed record trace of {len(self.__submodule_order)} sub modules: {[m.ds_id for m in self.__submodule_order]}",
                     force=False)
+                # Print trace summary
+                # self.print_trace_summary()
             else:
                 # Enable trace recording for next forward/backward pass
                 self.__trace_mode = ZeRoTraceMode.RECORD
@@ -263,6 +277,15 @@ class PartitionedParameterCoordinator:
         self.__step_id = 0
         self.__n_available_params = 0
         self.__profiler.reset_events()
+        
+        # Reset CPU cache at the start of each new iteration
+        # This ensures a clean state for each iteration and allows CPU cache to work within an iteration
+        # The cache will be built up during the forward/backward pass
+        if len(self.__cpu_buffer_pool) > 0:
+            num_cached_before = len(self.__cpu_cache)
+            # self._reset_cpu_cache()
+            if num_cached_before > 0:
+                print_rank_0(f"Reset CPU cache: cleared {num_cached_before} params from previous iteration", force=True)
 
     def _dump_params(self, tag, sub_module, params, step_id=None):
         if step_id is None:
@@ -298,6 +321,23 @@ class PartitionedParameterCoordinator:
                 }))
 
         params_to_fetch = set(iter_params(current_submodule, recurse=z3_leaf_module(current_submodule)))
+        
+        for param in params_to_fetch:
+            print_rank_0(f"[FETCH PARAMS] module {current_submodule.ds_id}, forward={forward}, param id: {param.ds_id}, numel: {param.ds_numel}, status: {param.ds_status.name}", force=False)
+            if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+                cpu_tensor = self._get_from_cpu_cache(param)
+                if cpu_tensor is not None:
+                    # cpu_tensor is the full parameter from cache (param.ds_numel elements)
+                    saved_ds_numel = param.ds_tensor.ds_numel if hasattr(param.ds_tensor, 'ds_numel') else param.ds_numel
+                    saved_final_location = param.ds_tensor.final_location if hasattr(param.ds_tensor, 'final_location') else None
+                    
+                    param.ds_tensor = cpu_tensor.flatten().contiguous()
+                    
+                    param.ds_tensor.ds_numel = saved_ds_numel
+                    param.ds_tensor.status = PartitionedParamStatus.AVAILABLE  # Skip NVMe read
+                    if saved_final_location is not None:
+                        param.ds_tensor.final_location = saved_final_location
+                    
         fetch_numel = sum(
             [p.partition_numel() for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
 
@@ -514,6 +554,186 @@ class PartitionedParameterCoordinator:
             if swap_persisted_params:
                 swap_persisted_params[0].nvme_swapper.remove_partition_and_release_buffers(swap_persisted_params)
 
+    def _pre_allocate_cpu_buffers(self, num_buffers: int, buffer_size: int) -> None:
+        """Pre-allocate a pool of pinned CPU buffers."""
+        print_rank_0(f"[CPU BUFFER POOL] Pre-allocating {num_buffers} CPU pinned buffers of size {buffer_size} elements (~{buffer_size * 2 / 1e9:.2f}GB each, ~{num_buffers * buffer_size * 2 / 1e9:.2f}GB total)", force=False)
+        
+        for i in range(num_buffers):
+            buffer_id = self.__buffer_counter
+            self.__buffer_counter += 1
+            cpu_buffer = torch.empty(buffer_size, dtype=torch.bfloat16).pin_memory()
+            self.__cpu_buffer_pool[buffer_id] = (cpu_buffer, False)
+        
+        print_rank_0(f"[CPU BUFFER POOL] Initialized with {len(self.__cpu_buffer_pool)} buffers, each {buffer_size} elements", force=False)
+
+    def _reset_cpu_cache(self) -> None:
+        """Reset CPU cache at the end of each iteration."""
+        # Clear cache entries
+        num_cached = len(self.__cpu_cache)
+        
+        # Release all buffers back to pool
+        for param_id in list(self.__cpu_cache.keys()):
+            buffer_id, _, _, _ = self.__cpu_cache.pop(param_id)
+            self._release_pinned_buffer(buffer_id)
+        
+        # Clear cache tracking
+        self.__cpu_cache.clear()
+        self.__cpu_cache_order.clear()
+        
+        if num_cached > 0:
+            if logger.isEnabledFor(logging.DEBUG):
+                debug_rank0(f"Reset CPU cache: cleared {num_cached} params")
+            else:
+                print_rank_0(f"Reset CPU cache: cleared {num_cached} params", force=False)
+
+    def _get_pinned_buffer(self, numel: int) -> int:
+        """Get a pinned buffer from pool, allocate new if needed."""
+        # Find unused buffer of appropriate size
+        buffer_id = None
+        for bid, (tensor, in_use) in self.__cpu_buffer_pool.items():
+            if not in_use and tensor.numel() >= numel:
+                buffer_id = bid
+                break
+        
+        # Allocate new buffer if no suitable one found
+        if buffer_id is None:
+            buffer_id = self.__buffer_counter
+            self.__buffer_counter += 1
+            # Allocate pinned memory - use max of requested size or standard size
+            actual_size = max(numel, self.__cpu_buffer_size)
+            cpu_buffer = torch.empty(actual_size, dtype=torch.bfloat16).pin_memory()
+            self.__cpu_buffer_pool[buffer_id] = (cpu_buffer, True)
+            if logger.isEnabledFor(logging.DEBUG):
+                debug_rank0(f"-allocate new pinned buffer {buffer_id}, size {actual_size}")
+        else:
+            self.__cpu_buffer_pool[buffer_id] = (self.__cpu_buffer_pool[buffer_id][0], True)
+            if logger.isEnabledFor(logging.DEBUG):
+                debug_rank0(f"-reuse pre-allocated pinned buffer {buffer_id}, size {numel}")
+        
+        return buffer_id
+    
+    def _release_pinned_buffer(self, buffer_id: int) -> None:
+        """Mark pinned buffer as available for reuse."""
+        if buffer_id in self.__cpu_buffer_pool:
+            tensor, _ = self.__cpu_buffer_pool[buffer_id]
+            self.__cpu_buffer_pool[buffer_id] = (tensor, False)
+            if logger.isEnabledFor(logging.DEBUG):
+                debug_rank0(f"-release pinned buffer {buffer_id}")
+    
+    def _evict_oldest_from_cpu_cache(self) -> None:
+        """Evict the oldest parameter from CPU cache to free a buffer."""
+        if len(self.__cpu_cache_order) > 0:
+            param_id = self.__cpu_cache_order.popleft()
+            if param_id in self.__cpu_cache:
+                buffer_id, dtype, shape, _ = self.__cpu_cache.pop(param_id)
+                # Release buffer back to pool
+                self._release_pinned_buffer(buffer_id)
+                if logger.isEnabledFor(logging.DEBUG):
+                    debug_rank0(f"-evict from CPU cache: param {param_id}")
+
+    def _add_to_cpu_cache(self, param: Parameter) -> bool:
+        """Add parameter to CPU cache with LRU management using pinned buffer.
+        
+        Returns:
+            bool: True if successfully cached, False otherwise
+        """
+        param_id = param.ds_id
+        param_size = param.ds_numel
+        param_data = param.data
+        
+        # Check if parameter is already in cache - if so, update it in place
+        if param_id in self.__cpu_cache:
+            old_buffer_id, old_dtype, old_shape, _ = self.__cpu_cache[param_id]
+            # Reuse the same buffer if size fits
+            cpu_buffer, _ = self.__cpu_buffer_pool[old_buffer_id]
+            if cpu_buffer.numel() >= param_size:
+                # Update data in existing buffer
+                flat_data = param_data.flatten()[:param_size]
+                cpu_buffer[:param_size].copy_(flat_data, non_blocking=True)
+                # Update metadata
+                self.__cpu_cache[param_id] = (old_buffer_id, param_data.dtype, param.ds_shape, self.__step_id)
+                # Update LRU order
+                try:
+                    self.__cpu_cache_order.remove(param_id)
+                except ValueError:
+                    pass
+                self.__cpu_cache_order.append(param_id)
+                print_rank_0(f"[CACHE UPDATE] param {param_id}, size {param_size}, total cached: {len(self.__cpu_cache)}", force=False)
+                return True
+            else:
+                # Buffer too small, need to allocate new one - release old buffer first
+                self._release_pinned_buffer(old_buffer_id)
+                try:
+                    self.__cpu_cache_order.remove(param_id)
+                except ValueError:
+                    pass
+                del self.__cpu_cache[param_id]
+        
+        # Try to get a pinned buffer (may evict if pool is full)
+        # First try without evicting
+        buffer_id = None
+        for bid, (tensor, in_use) in self.__cpu_buffer_pool.items():
+            if not in_use and tensor.numel() >= param_size:
+                buffer_id = bid
+                break
+        
+        # If no buffer available, evict oldest and try again
+        if buffer_id is None:
+            self._evict_oldest_from_cpu_cache()
+            # Try again after eviction
+            for bid, (tensor, in_use) in self.__cpu_buffer_pool.items():
+                if not in_use and tensor.numel() >= param_size:
+                    buffer_id = bid
+                    break
+        
+        if buffer_id is None:
+            print_rank_0(f"[CACHE FAIL] param {param_id} size {param_size} - no available buffer", force=True)
+            return False
+        
+        cpu_buffer, _ = self.__cpu_buffer_pool[buffer_id]
+        
+        # Mark buffer as in use
+        self.__cpu_buffer_pool[buffer_id] = (cpu_buffer, True)
+        
+        # Copy data to pinned buffer
+        flat_data = param_data.flatten()[:param_size]
+        cpu_buffer[:param_size].copy_(flat_data, non_blocking=True)
+        
+        # Store metadata: buffer_id, original dtype, shape, step_id
+        self.__cpu_cache[param_id] = (buffer_id, param_data.dtype, param.ds_shape, self.__step_id)
+        self.__cpu_cache_order.append(param_id)
+        
+        print_rank_0(f"[CACHE ADD] param {param_id}, size {param_size}, dtype {param_data.dtype}, shape {param.ds_shape}, total cached: {len(self.__cpu_cache)}", force=False)
+        if logger.isEnabledFor(logging.DEBUG):
+            debug_rank0(f"+add to CPU cache: param {param_id}, size {param_size}, dtype {param_data.dtype}, shape {param.ds_shape}")
+        
+        return True
+
+    def _get_from_cpu_cache(self, param: Parameter) -> torch.Tensor:
+        """Get parameter from CPU cache and update LRU order."""
+        param_id = param.ds_id
+        
+        # Debug: check if param_id exists in cache
+        if param_id not in self.__cpu_cache:
+            return None
+            
+        # Update LRU order
+        try:
+            self.__cpu_cache_order.remove(param_id)
+        except ValueError:
+            print_rank_0(f"[CACHE WARNING] param {param_id} in cache but not in order", force=False)
+        self.__cpu_cache_order.append(param_id)
+        
+        buffer_id, dtype, shape, _ = self.__cpu_cache[param_id]
+        cpu_buffer, _ = self.__cpu_buffer_pool[buffer_id]
+        
+        # Restore tensor with correct dtype and shape
+        tensor = cpu_buffer[:param.ds_numel].view(shape).to(dtype)
+        print_rank_0(f"[CPU CACHE HIT] {param.ds_summary()}, dtype {dtype}, shape {shape}", force=False)
+        if logger.isEnabledFor(logging.DEBUG):
+            debug_rank0(f"✓ restore from CPU cache: {param.ds_summary()}")
+        return tensor
+
     @compiler.disable
     @instrument_w_nvtx
     def __release_param(self, param: Parameter, free_data: bool = True) -> None:
@@ -521,6 +741,23 @@ class PartitionedParameterCoordinator:
             if logger.isEnabledFor(logging.DEBUG):
                 debug_rank0(f"-release: {param.ds_summary()}")
                 print_rank_0(f"release: {debug_param2name_id_shape(param)}", force=False)
+            
+            # Try to cache on CPU if enabled - only for those param that are not persisted and will be saved on NVMe parameters
+            if len(self.__cpu_buffer_pool) > 0 and not param.ds_persist:
+                # Check if this parameter is stored on NVMe
+                is_nvme_param = (
+                    param.nvme_swapper is not None and 
+                    hasattr(param, 'ds_tensor') and 
+                    param.ds_tensor is not None and
+                    param.ds_tensor.final_location == OffloadDeviceEnum.nvme
+                )
+                
+                if is_nvme_param:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        debug_rank0(f"Caching NVMe parameter {param.ds_id} to CPU")
+                    self._add_to_cpu_cache(param)
+                elif logger.isEnabledFor(logging.DEBUG):
+                    debug_rank0(f"Skipping CPU cache for non-NVMe parameter {param.ds_id}")
             param.partition(free_data=free_data)
             self.__n_available_params -= param.ds_numel
 
@@ -583,3 +820,69 @@ class PartitionedParameterCoordinator:
 
         if swap_in_params:
             swap_in_params[0].nvme_swapper.swap_in(swap_in_params, async_op=True)
+
+    def print_trace(self, detailed: bool = False) -> None:
+        """Print the recorded trace of modules and parameters.
+        
+        Args:
+            detailed: If True, prints detailed parameter information for each module
+        """
+        
+        print_rank_0("\n" + "="*80, force=True)
+        print_rank_0("ZERO-3 PARAMETER TRACE", force=True)
+        print_rank_0("="*80, force=True)
+        
+        print_rank_0(f"\nTrace Mode: {self.__trace_mode}", force=True)
+        print_rank_0(f"Total Submodules in Trace: {len(self.__submodule_order)}", force=True)
+        print_rank_0(f"Total Parameters in Trace: {len(self.__param_order)}", force=True)
+        
+        if self.__trace_mode == ZeRoTraceMode.COMPLETE:
+            print_rank_0("\n" + "-"*80, force=True)
+            print_rank_0("MODULE EXECUTION ORDER:", force=True)
+            print_rank_0("-"*80, force=True)
+            
+            # Print module order
+            for step_id, module in enumerate(self.__submodule_order):
+                is_leaf = z3_leaf_module(module)
+                module_type = type(module).__name__
+                print_rank_0(
+                    f"Step {step_id:4d}: Module {module.ds_id:4d} | "
+                    f"{module_type:30s} | Leaf: {is_leaf}",
+                    force=True
+                )
+            
+            if detailed:
+                print_rank_0("\n" + "-"*80, force=True)
+                print_rank_0("PARAMETER EXECUTION ORDER:", force=True)
+                print_rank_0("-"*80, force=True)
+                
+                # Print parameter order
+                for step_id, param_trace in enumerate(self.__param_order):
+                    param = param_trace.param
+                    step_id_last_used = param_trace.step_id_last_used_at
+                    print_rank_0(
+                        f"Step {step_id:4d}: Param {param.ds_id:4d} | "
+                        f"Last used at step {step_id_last_used:4d} | "
+                        f"Shape {param.ds_shape} | "
+                        f"Numel {param.ds_numel:,}",
+                        force=True
+                )
+            
+            # Print parameter queue info
+            if self.__param_queue:
+                print_rank_0("\n" + "-"*80, force=True)
+                print_rank_0(f"PARAMETER QUEUE (current size: {len(self.__param_queue)}):", force=True)
+                print_rank_0("-"*80, force=True)
+                
+                for i, param_trace in enumerate(list(self.__param_queue)[:10]):  # Show first 10
+                    param = param_trace.param
+                    print_rank_0(
+                        f"  [{i}]: Param {param.ds_id:4d} | "
+                        f"Last used at step {param_trace.step_id_last_used_at:4d}",
+                        force=True
+                    )
+                
+                if len(self.__param_queue) > 10:
+                    print_rank_0(f"  ... and {len(self.__param_queue) - 10} more", force=True)
+        
+        print_rank_0("\n" + "="*80 + "\n", force=True)

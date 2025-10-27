@@ -239,6 +239,18 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     values use less memory, but perform more communication.
     """
 
+    cpu_buffer_pool_size: int = Field(10, ge=0, alias="stage3_cpu_buffer_pool_size")
+    """
+    Number of pre-allocated pinned CPU buffers in the buffer pool for parameter caching.
+    Larger values use more CPU memory but reduce allocation overhead.
+    """
+
+    cpu_buffer_size: int = Field(pp_int(1e8), ge=0, alias="stage3_cpu_buffer_size")
+    """
+    Size of each pre-allocated pinned CPU buffer in number of elements.
+    Should be large enough to hold typical parameter tensors sequentially.
+    """
+
     max_reuse_distance: int = Field(pp_int(1e9), ge=0, alias="stage3_max_reuse_distance")
     """
     Do not release a parameter if it will be reused within this threshold of

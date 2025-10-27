@@ -1107,6 +1107,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
     def _zero_init_param(self, param):
         self._convert_to_deepspeed_param(param)
+        
+        print_rank_0(f"[INIT PARAM] id={param.ds_id}, shape={param.shape}, numel={param.numel()}, "
+                    f"dtype={param.dtype}, device={param.device}", force=False)
+        
         if dist.get_world_group() == self.get_dp_process_group():
             dist.broadcast(param.data, 0, self.get_dp_process_group())
         else:
