@@ -320,28 +320,36 @@ class PartitionedParameterCoordinator:
         wait_numel = 0
         wait_event_name = __class__.FORWARD_FETCH_WAIT if forward else __class__.BACKWARD_FETCH_WAIT
         self.__profiler.start_event(wait_event_name)
+        self.fast_sharding_for_leaf_module = True
         fast_fetch = self.fast_sharding_for_leaf_module and z3_leaf_module(current_submodule)
         # wait for parameters in the immediately needed submodule to become available
-        for param in params_to_fetch:
-            param.ds_active_sub_modules.add(current_submodule.ds_id)
-            if logger.isEnabledFor(logging.DEBUG):
-                debug_rank0(f"-wait: {param.ds_summary()}")
-            if param in self.__inflight_param_registry:
-                wait_numel += param.partition_numel()
-                with get_accelerator().stream(self.__allgather_stream):
-                    while self.__ongoing_fetch_events and self.__ongoing_fetch_events[0].query():
-                        self.__ongoing_fetch_events.popleft()
-                    if len(self.__ongoing_fetch_events) > self.__max_ongoing_fetch_events:
-                        self.__ongoing_fetch_events.popleft().synchronize()
+        if fast_fetch:
+            # Batch wait unique inflight handles to reduce per-param wait overhead
+            wait_numel += self.__batch_wait_inflight(params_to_fetch, fast_fetch)
+            for param in params_to_fetch:
+                param.ds_active_sub_modules.add(current_submodule.ds_id)
+                assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
+        else:
+            for param in params_to_fetch:
+                param.ds_active_sub_modules.add(current_submodule.ds_id)
+                if logger.isEnabledFor(logging.DEBUG):
+                    debug_rank0(f"-wait: {param.ds_summary()}")
+                if param in self.__inflight_param_registry:
+                    wait_numel += param.partition_numel()
+                    with get_accelerator().stream(self.__allgather_stream):
+                        while self.__ongoing_fetch_events and self.__ongoing_fetch_events[0].query():
+                            self.__ongoing_fetch_events.popleft()
+                        if len(self.__ongoing_fetch_events) > self.__max_ongoing_fetch_events:
+                            self.__ongoing_fetch_events.popleft().synchronize()
 
-                    self.__inflight_param_registry.pop(param).wait(handle_dependency=not fast_fetch)
+                        self.__inflight_param_registry.pop(param).wait(handle_dependency=not fast_fetch)
 
-                    if not get_accelerator().handles_memory_backpressure() and not fast_fetch:
-                        event = get_accelerator().Event()
-                        event.record()
-                        self.__ongoing_fetch_events.append(event)
+                        if not get_accelerator().handles_memory_backpressure() and not fast_fetch:
+                            event = get_accelerator().Event()
+                            event.record()
+                            self.__ongoing_fetch_events.append(event)
 
-            assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
+                assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
         if not get_accelerator().resolves_data_dependency():
             get_accelerator().current_stream().wait_stream(self.__allgather_stream)
         if fast_fetch:
@@ -420,8 +428,8 @@ class PartitionedParameterCoordinator:
 
         self.__step_id += 1
 
-    @instrument_w_nvtx
     @torch.no_grad()
+    @compiler.disable
     def release_sub_module(self, submodule: Module, forward=False) -> None:
         """release the parameters of a sub module, assuming they meet conditions to
         be released."""
@@ -433,15 +441,32 @@ class PartitionedParameterCoordinator:
         if not free_data:
             # wait for the computation to finish and launch as early as possible.
             empty_buffer = torch.empty(1, device=get_accelerator().current_device())
-
-        for param in iter_params(submodule, recurse=z3_leaf_module(submodule)):
-            param.ds_active_sub_modules.discard(submodule.ds_id)
-            if param.ds_id in params_to_release and not param.is_external_param:
-                self.__release_param(param, free_data)
-            if not free_data:
+        self.fast_sharding_for_leaf_module = True
+        # Fast path: for leaf + fast sharding, build the to-release list once and batch-release
+        if z3_leaf_module(submodule) and self.fast_sharding_for_leaf_module:
+            to_release = []
+            for param in iter_params(submodule, recurse=True):
+                param.ds_active_sub_modules.discard(submodule.ds_id)
                 if param.ds_id in params_to_release and not param.is_external_param:
-                    # empty buffer ensures that all computations are complete
-                    param.data = empty_buffer
+                    to_release.append(param)
+
+            if not free_data:
+                # Single empty buffer acts as a compute fence for all params
+                empty_buffer = torch.empty(1, device=get_accelerator().current_device())
+                for p in to_release:
+                    p.data = empty_buffer
+
+            for p in to_release:
+                self.__release_param(p, free_data)
+        else:
+            for param in iter_params(submodule, recurse=z3_leaf_module(submodule)):
+                param.ds_active_sub_modules.discard(submodule.ds_id)
+                if param.ds_id in params_to_release and not param.is_external_param:
+                    self.__release_param(param, free_data)
+                if not free_data:
+                    if param.ds_id in params_to_release and not param.is_external_param:
+                        # empty buffer ensures that all computations are complete
+                        param.data = empty_buffer
 
     @instrument_w_nvtx
     @torch.no_grad()
@@ -513,6 +538,43 @@ class PartitionedParameterCoordinator:
             ]
             if swap_persisted_params:
                 swap_persisted_params[0].nvme_swapper.remove_partition_and_release_buffers(swap_persisted_params)
+
+    def __batch_wait_inflight(self, params: Set[Parameter], fast_fetch: bool) -> int:
+        """Batch-wait unique inflight handles for the given params.
+
+        Returns total numel waited, matching the semantics of wait_numel accounting.
+        """
+        wait_numel = 0
+        unique_handles = {}
+
+        # Drain completed events and cap ongoing events similar to per-param path
+        with get_accelerator().stream(self.__allgather_stream):
+            while self.__ongoing_fetch_events and self.__ongoing_fetch_events[0].query():
+                self.__ongoing_fetch_events.popleft()
+            if len(self.__ongoing_fetch_events) > self.__max_ongoing_fetch_events:
+                self.__ongoing_fetch_events.popleft().synchronize()
+
+        for param in params:
+            if param in self.__inflight_param_registry:
+                wait_numel += param.partition_numel()
+                handle = self.__inflight_param_registry[param]
+                key = id(handle)
+                if key not in unique_handles:
+                    unique_handles[key] = handle
+
+        for handle in unique_handles.values():
+            handle.wait(handle_dependency=not fast_fetch)
+
+        if not get_accelerator().handles_memory_backpressure() and not fast_fetch and unique_handles:
+            event = get_accelerator().Event()
+            event.record()
+            self.__ongoing_fetch_events.append(event)
+
+        for param in params:
+            if param in self.__inflight_param_registry:
+                self.__inflight_param_registry.pop(param)
+
+        return wait_numel
 
     @compiler.disable
     @instrument_w_nvtx

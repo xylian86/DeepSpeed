@@ -138,7 +138,7 @@ class AsyncPartitionedParameterSwapper(object):
             assert numel is None, "Both parma and numel cannot be provided"
             numel = param.ds_tensor.ds_numel
         if numel is not None:
-            return self.min_aio_bytes <= numel * self.swap_element_size
+            return self.min_aio_bytes <= numel * self.swap_element_size and numel <= self.elements_per_buffer
         assert False, "Either param or numel must be provided"
 
     def get_path(self, param, must_exist=False):
@@ -188,7 +188,7 @@ class AsyncPartitionedParameterSwapper(object):
             ), f"param {param_id} has already been assigned a swap buffer"
 
             buffer_id = self.available_buffer_ids.pop()
-            print_rank_0(f"param {param.ds_id} is assigned swap in buffer id {buffer_id}  ")
+            print_rank_0(f"param {param.ds_id} is assigned swap in buffer id {buffer_id}  ", force=True)
             self.param_id_to_buffer_id[param_id] = buffer_id
             aligned_swap_numel = self._io_aligned_numel(self.param_id_to_numel[param_id])
             swap_buffer = self.buffers.narrow(0, int(buffer_id * self.aligned_elements_per_buffer), aligned_swap_numel)
@@ -246,7 +246,7 @@ class AsyncPartitionedParameterSwapper(object):
                 self.available_buffer_ids.append(buffer_id)
                 del self.param_id_to_buffer_id[param_id]
                 del self.param_id_to_swap_buffer[param_id]
-                print_rank_0(f"param {param.ds_id} releases buffer id {buffer_id}  ")
+                print_rank_0(f"param {param.ds_id} releases buffer id {buffer_id}  ", force=True)
 
                 if param_id in self.available_params:
                     self.available_params.remove(param_id)
@@ -364,7 +364,7 @@ class AsyncPartitionedParameterSwapper(object):
 
         self.param_id_to_swap_buffer[param_id] = swap_buffer
         compute_buffer = swap_buffer.narrow(0, 0, self.param_id_to_numel[param_id])
-        print_rank_0(f"param {param.ds_id} is assigned swap in buffer id {buffer_id}")
+        print_rank_0(f"param {param.ds_id} is assigned swap in buffer id {buffer_id}", force=True)
         return compute_buffer
 
     def reserve_available_buffers(self):
