@@ -106,7 +106,7 @@ from deepspeed.runtime.torch_autocast import init_autocast_params, get_default_a
 
 from .pipe.module import PipelineModule
 from .utils import get_ma_status
-from .compiler import is_compile_supported
+from .compiler import is_compile_supported, compiled_autograd
 from ..ops.adam import FusedAdam
 from ..moe.sharded_moe import TopKGate, MOELayer
 from ..moe.layer import MoE
@@ -445,6 +445,9 @@ class DeepSpeedEngine(Module):
             # that have been computed. When all gradients are ready, it calls `_backward_post_hook`.
             # See also: https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.register_full_backward_hook
             self.optimizer.register_grad_acc_post_hook(self._backward_post_hook)
+
+        self._is_compiled_autograd_enabled = False
+        self._compile_kwargs = {}
 
     def _optimized_linear_offload_setup(self):
         self.optimized_linear_base_weight_sharding = False
@@ -2476,17 +2479,18 @@ class DeepSpeedEngine(Module):
         elif self.torch_autocast_z0_gradscaler:
             loss = self.torch_autocast_z0_gradscaler.scale(loss)
 
-        if self.zero_optimization() or not self.amp_enabled():
-            loss.backward(**backward_kwargs)
-        elif self.amp_enabled():
-            # AMP requires delaying unscale when inside gradient accumulation boundaries
-            # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
-            delay_unscale = not self.is_gradient_accumulation_boundary()
-            with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
-                scaled_loss.backward(**backward_kwargs)
+        with compiled_autograd(self._is_compiled_autograd_enabled, self._compile_kwargs):
+            if self.zero_optimization() or not self.amp_enabled():
+                loss.backward(**backward_kwargs)
+            elif self.amp_enabled():
+                # AMP requires delaying unscale when inside gradient accumulation boundaries
+                # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
+                delay_unscale = not self.is_gradient_accumulation_boundary()
+                with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
+                    scaled_loss.backward(**backward_kwargs)
 
-        # backward_epilogue is not called in a hook when self._support_torch_style_backward is False
-        self._backward_epilogue()
+            # backward_epilogue is not called in a hook when self._support_torch_style_backward is False
+            self._backward_epilogue()
 
         self._running_engine_backward = False
 
@@ -4205,7 +4209,11 @@ class DeepSpeedEngine(Module):
             gc.collect()
             get_accelerator().empty_cache()
 
-    def compile(self, backend=get_accelerator().get_compile_backend(), compile_kwargs={}, schedule=None) -> None:
+    def compile(self,
+                backend=get_accelerator().get_compile_backend(),
+                compile_kwargs={},
+                schedule=None,
+                compiled_autograd_enabled=False) -> None:
         """Compile the module using the specified backend and kwargs.
         If a compiler_fn is set, it will be used instead of torch.compile().
         """
@@ -4271,6 +4279,13 @@ class DeepSpeedEngine(Module):
             raise
 
         self._is_compiled = True
+        self._compile_kwargs = compile_kwargs
+        if compiled_autograd_enabled:
+            if not self._deepcompile_active:
+                self._is_compiled_autograd_enabled = compiled_autograd_enabled
+            else:
+                logger.warning("Compiled autograd is not compatible with DeepCompile, disabling compiled autograd.")
+                self._is_compiled_autograd_enabled = False
 
     def _set_deepcompile_active(self, active: bool) -> None:
         """Toggle DeepCompile runtime state and manage forward hooks accordingly."""
