@@ -878,6 +878,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     self.subgroup_to_device[i] = 'cpu'
                 else:
                     self.subgroup_to_device[i] = get_accelerator()._name
+        print(f"[DEBUG] self.subgroup_to_device is {self.subgroup_to_device}")
 
         for i, tensor in enumerate(self.fp16_partitioned_groups_flat):
             num_elements = self.fp16_partitioned_groups_flat_numel[i]
