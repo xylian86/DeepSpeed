@@ -13,6 +13,15 @@ import torch
 from deepspeed import comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.ops.op_builder import AsyncIOBuilder
+
+# SuperRL-Cache shim: set by DeepSpeedEngine after warm-up if enabled.
+# When set, swap_in() checks here before issuing NVMe reads.
+_superrl_cache = None  # type: ignore[assignment]
+
+
+def set_superrl_cache(cache) -> None:
+    global _superrl_cache
+    _superrl_cache = cache
 from deepspeed.ops.op_builder import GDSBuilder
 from .constants import *
 from .utils import swap_in_tensors, swap_out_tensors, MIN_AIO_BYTES, AIO_ALIGNED_BYTES, print_object, SwapBufferPool
@@ -227,6 +236,18 @@ class AsyncPartitionedParameterSwapper(object):
         self.available_params.update([param.ds_id for param in self.inflight_params])
         self.available_numel += self.inflight_numel
 
+        # SuperRL-Cache: now that the GPU buffers hold valid data fetched
+        # from NVMe, insert a host-pinned copy into the DRAM look-ahead
+        # cache so future swap-ins can hit. ``insert`` will Belady-evict
+        # cooler entries to make room. We skip when the cache is disabled
+        # or when no trace is installed (warmup phase) to avoid wasting
+        # PCIe and DRAM on entries we can't yet rank.
+        if _superrl_cache is not None and getattr(_superrl_cache, "_trace", None):
+            for param, swap_in_buffer in zip(self.inflight_params, self.inflight_swap_in_buffers):
+                param_id = param.ds_id
+                gpu_view = swap_in_buffer.narrow(0, 0, self.param_id_to_numel[param_id])
+                _superrl_cache.insert(param_id, gpu_view)
+
         self.inflight_params = []
         self.inflight_swap_in_buffers = []
         self.inflight_numel = 0
@@ -292,6 +313,41 @@ class AsyncPartitionedParameterSwapper(object):
 
         assert all([param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE
                     for param in params]), "Some params are already available or in flight"
+
+        # SuperRL-Cache: serve from DRAM if present, skipping NVMe read.
+        # The cache stores host-pinned tensors (DRAM tier per paper
+        # sec. IV.B). On hit we still need GPU memory for ZeRO-3, so we
+        # allocate a regular GPU swap-in buffer and H2D copy from the
+        # cached pinned tensor instead of issuing an NVMe read. The H2D
+        # is non-blocking on the default stream, which serializes
+        # naturally with subsequent compute on the param. We then mark
+        # the param AVAILABLE without going through the ``pending_reads``
+        # path (which only counts NVMe ops registered with aio_read_handle).
+        if _superrl_cache is not None:
+            miss_params = []
+            hit_pairs = []
+            for param in params:
+                cached = _superrl_cache.lookup(param.ds_id)
+                expected_numel = self.param_id_to_numel.get(param.ds_id, -1)
+                if cached is None or cached.numel() < expected_numel:
+                    miss_params.append(param)
+                else:
+                    hit_pairs.append((param, cached))
+            if hit_pairs:
+                hit_only = [p for p, _ in hit_pairs]
+                _, hit_swap_in_buffers = self._allocate_and_return_buffers_for_swap_in(hit_only)
+                for (param, cached), swap_buf in zip(hit_pairs, hit_swap_in_buffers):
+                    src_view = cached.narrow(0, 0, min(cached.numel(), swap_buf.numel()))
+                    swap_buf.narrow(0, 0, src_view.numel()).copy_(src_view, non_blocking=True)
+                    compute_buffer = swap_buf.narrow(0, 0, self.param_id_to_numel[param.ds_id])
+                    param.ds_tensor.data = compute_buffer.data
+                    param.ds_tensor.status = PartitionedParamStatus.AVAILABLE
+                    self.available_params.add(param.ds_id)
+                    self.available_numel += param.ds_tensor.numel()
+            if not miss_params:
+                return
+            params = miss_params  # fall through for NVMe reads
+
         swap_in_paths = self._get_swap_paths(params)
 
         if swap_in_buffers is None:

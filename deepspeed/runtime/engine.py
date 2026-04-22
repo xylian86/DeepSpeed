@@ -457,6 +457,145 @@ class DeepSpeedEngine(Module):
         self._is_compiled_autograd_enabled = False
         self._compile_kwargs = {}
 
+        # SuperRL-Cache: warm-up trace recorder + DRAM look-ahead cache.
+        self._superrl_cache = None
+        self._superrl_recorder = None
+        self._superrl_warmup_remaining = 0
+        self._configure_superrl_cache()
+
+    def _configure_superrl_cache(self):
+        """Create the SuperRL look-ahead DRAM cache and a warm-up trace
+        recorder, then register the cache with the partitioned-param swapper
+        so swap-in calls can hit DRAM before NVMe.
+
+        Safe to call when SuperRL-Cache is disabled - returns immediately.
+        """
+        cfg = getattr(self._config, 'superrl_cache_config', None)
+        if cfg is None or not cfg.enabled:
+            return
+        try:
+            from deepspeed.runtime.superrl.cache import LookaheadDRAMCache, TraceRecorder
+            from deepspeed.runtime.swap_tensor.partitioned_param_swapper import set_superrl_cache
+        except Exception as exc:
+            logger.warning(f"SuperRL-Cache disabled: import failed: {exc}")
+            return
+
+        nvme_engine = None
+        io_cfg = getattr(self._config, 'superrl_io_config', None)
+        if io_cfg is not None and io_cfg.enabled:
+            try:
+                from deepspeed.runtime.superrl.io import CoalescedNVMeEngine
+                nvme_engine = CoalescedNVMeEngine.from_config(io_cfg)
+            except Exception as exc:
+                logger.warning(
+                    f"SuperRL-Cache: NVMe engine unavailable, prefetch_window will no-op: {exc}"
+                )
+
+        self._superrl_cache = LookaheadDRAMCache(
+            dram_budget_bytes=cfg.dram_budget_bytes,
+            nvme_engine=nvme_engine,
+            window_size=cfg.window_size,
+        )
+        set_superrl_cache(self._superrl_cache)
+
+        self._superrl_recorder = TraceRecorder(
+            self.module, moe_leaf_aggregation=cfg.moe_leaf_aggregation
+        )
+        self._superrl_warmup_remaining = max(1, cfg.warmup_iters)
+        if self.global_rank == 0:
+            logger.info(
+                f"SuperRL-Cache enabled: budget={cfg.dram_budget_bytes} bytes, "
+                f"warmup_iters={cfg.warmup_iters}, moe_leaf={cfg.moe_leaf_aggregation}"
+            )
+
+    def _superrl_step_begin(self):
+        """Called at the top of ``step``: feed the trace recorder and reset
+        the cache cursor. Cheap when SuperRL-Cache is disabled.
+
+        Once warmup is over and a trace is installed, also kick off a
+        look-ahead prefetch (paper sec. IV.B "Pipelined Prefetching"):
+        the cache will issue large coalesced async NVMe reads for the
+        next parameters in the trace into pinned host buffers, so that
+        when the swapper asks for them later in the step the lookup
+        already hits.
+        """
+        if self._superrl_cache is None:
+            return
+        if self._superrl_recorder is not None and self._superrl_warmup_remaining > 0:
+            self._superrl_recorder.start_step()
+        self._superrl_cache.reset_position()
+        # Look-ahead prefetch: only after warmup (trace installed) and
+        # only when the cache has an NVMe engine to prefetch through.
+        if (
+            self._superrl_warmup_remaining == 0
+            and getattr(self._superrl_cache, "nvme_engine", None) is not None
+        ):
+            try:
+                paths, shapes, dtypes = self._superrl_collect_param_metadata()
+                if paths:
+                    self._superrl_cache.prefetch_window(paths, shapes, dtypes)
+            except Exception as exc:  # never let prefetch break the step
+                logger.warning(f"SuperRL-Cache: prefetch_window skipped: {exc}")
+
+    def _superrl_collect_param_metadata(self):
+        """Build {ds_id: path/shape/dtype} maps from the ZeRO-3 swapper.
+
+        The maps are derived from ``partitioned_param_swapper`` state so
+        that ds_id<->path bookkeeping stays single-sourced. Params that
+        the swapper has not yet seen (very first step) are skipped; on
+        subsequent steps every offloaded param will be present.
+        """
+        paths, shapes, dtypes = {}, {}, {}
+        swapper = getattr(self.optimizer, "param_swapper", None) or getattr(
+            self.optimizer, "partitioned_param_swapper", None
+        )
+        if swapper is None:
+            return paths, shapes, dtypes
+        id_to_path = getattr(swapper, "id_to_path", {})
+        param_id_to_numel = getattr(swapper, "param_id_to_numel", {})
+        ds_dtype = getattr(swapper, "dtype", None)
+        for p in self.module.parameters():
+            ds_id = getattr(p, "ds_id", None)
+            if ds_id is None or ds_id not in id_to_path:
+                continue
+            numel = param_id_to_numel.get(ds_id)
+            if numel is None:
+                continue
+            paths[ds_id] = id_to_path[ds_id]
+            shapes[ds_id] = (numel,)
+            dtypes[ds_id] = ds_dtype if ds_dtype is not None else p.dtype
+        return paths, shapes, dtypes
+
+    def _superrl_step_end(self):
+        """Called at the end of ``step``: close the recorder window, and on
+        the last warmup step install the merged trace into the cache.
+
+        TraceRecorder emits Python ``id(param)`` ints; we translate to
+        DeepSpeed ``ds_id`` before installing because ``ds_id`` is what
+        the partitioned-param swapper uses as the cache lookup key.
+        """
+        if self._superrl_cache is None:
+            return
+        if self._superrl_recorder is None or self._superrl_warmup_remaining <= 0:
+            return
+        self._superrl_recorder.end_step()
+        self._superrl_warmup_remaining -= 1
+        if self._superrl_warmup_remaining == 0:
+            from deepspeed.runtime.superrl.cache import (
+                merge_traces, translate_param_ids_to_ds_ids,
+            )
+            traces = self._superrl_recorder.traces()
+            merged_param_ids = merge_traces(traces)
+            merged_ds = translate_param_ids_to_ds_ids(merged_param_ids, self.module)
+            self._superrl_cache.update_trace(merged_ds)
+            self._superrl_recorder.detach()
+            if self.global_rank == 0:
+                logger.info(
+                    "SuperRL-Cache: trace installed, "
+                    f"len={len(merged_ds)} ds_ids "
+                    f"(from {len(merged_param_ids)} param ids in {len(traces)} warmup traces)"
+                )
+
     def _optimized_linear_offload_setup(self):
         self.optimized_linear_base_weight_sharding = False
         self.optimized_linear_lora_enabled = False
@@ -2648,6 +2787,9 @@ class DeepSpeedEngine(Module):
 
         see_memory_usage("Engine before step", force=self.memory_breakdown())
 
+        # SuperRL-Cache: feed the warmup trace recorder and reset trace cursor.
+        self._superrl_step_begin()
+
         # Check early because self.global_steps is incremented at some point here.
         # TODO: Delay self.global_steps increment until very end of this function.
         flops_profiler_active = self.flops_profiler_enabled(
@@ -2761,6 +2903,10 @@ class DeepSpeedEngine(Module):
 
         self.micro_steps += 1
         see_memory_usage("Engine after step", force=self.memory_breakdown())
+
+        # SuperRL-Cache: close the trace recorder window for this step and,
+        # on the final warmup step, install the merged trace into the cache.
+        self._superrl_step_end()
 
     def _start_timers(self, timer_names):
         for name in timer_names:

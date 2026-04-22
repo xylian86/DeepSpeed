@@ -53,6 +53,8 @@ from ..profiling.config import DeepSpeedFlopsProfilerConfig
 from ..autotuning.config import DeepSpeedAutotuningConfig
 from ..nebula.config import DeepSpeedNebulaConfig
 from ..datastates.config import DeepSpeedDataStatesConfig
+from .superrl.io.config import SuperRLIOConfig
+from .superrl.cache.config import SuperRLCacheConfig
 
 from ..compression.config import get_compression_config, get_quantize_enabled
 from ..compression.constants import *
@@ -861,6 +863,8 @@ class DeepSpeedConfig(object):
 
         self.nebula_config = DeepSpeedNebulaConfig(param_dict)
         self.datastates_config = DeepSpeedDataStatesConfig(param_dict)
+        self.superrl_io_config = SuperRLIOConfig(param_dict)
+        self.superrl_cache_config = SuperRLCacheConfig(param_dict)
         self.checkpoint_config = get_checkpoint_config(param_dict)
 
         self.weight_quantization_config = WeightQuantConfig(

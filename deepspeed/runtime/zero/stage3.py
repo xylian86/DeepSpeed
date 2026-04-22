@@ -34,6 +34,7 @@ from deepspeed.runtime.swap_tensor.partitioned_param_swapper import PartitionedP
 from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerSwapper
 from deepspeed.runtime.swap_tensor.partitioned_optimizer_swapper import PartitionedOptimizerSwapper
 from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedOptimizerSwapper
+from deepspeed.runtime.superrl.io import SuperRLPipelinedGPUAdam, CoalescedNVMeEngine
 from deepspeed.checkpoint.constants import OPTIMIZER_STATE_DICT, FP32_FLAT_GROUPS, PARTITION_COUNT, ZERO_STAGE, LOSS_SCALER
 from deepspeed.accelerator import get_accelerator
 
@@ -700,6 +701,24 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         os.makedirs(nvme_swap_folder, exist_ok=True)
         if dist.get_rank() == 0:
             logger.info('Tensor Swapping: Adding optimizer tensors')
+
+        # Use SuperRL pipelined GPU Adam when configured; it drives its own
+        # NVMe engine and does not go through the swapper machinery.
+        superrl_io_cfg = getattr(getattr(self, '_config', None), 'superrl_io_config', None)
+        if superrl_io_cfg is not None and superrl_io_cfg.enabled and superrl_io_cfg.pipelined_adam:
+            nvme_engine = CoalescedNVMeEngine.from_config(superrl_io_cfg)
+            # ``double_buffer_bytes`` is the legacy name for the per-pipeline-stage
+            # buffer budget; the rewritten optimizer takes the same number as
+            # ``chunk_bytes`` since each pipeline ring slot allocates one chunk.
+            self.optimizer = SuperRLPipelinedGPUAdam(
+                self.optimizer.param_groups,
+                nvme_engine=nvme_engine,
+                swap_folder=os.path.join(nvme_swap_folder, f'rank{dist.get_rank()}'),
+                chunk_bytes=superrl_io_cfg.double_buffer_bytes,
+            )
+            if dist.get_rank() == 0:
+                logger.info('SuperRL: using SuperRLPipelinedGPUAdam over NVMe')
+            return
 
         swapper_type = PipelinedOptimizerSwapper if offload_optimizer_config.pipeline else PartitionedOptimizerSwapper
 
