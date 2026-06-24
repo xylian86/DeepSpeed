@@ -3,6 +3,9 @@
 
 # DeepSpeed Team
 
+import pytest
+from pydantic import ValidationError
+
 from deepspeed.runtime.zero.config import DeepSpeedZeroConfig, DeepSpeedZeroOffloadParamConfig, DeepSpeedZeroOffloadOptimizerConfig
 
 
@@ -71,4 +74,41 @@ def test_zero_offload_optimizer_config_pipeline():
     assert config.pipeline == True
 
     config = DeepSpeedZeroOffloadOptimizerConfig(**{"pipeline_read": True, "pipeline_write": True})
+    assert config.pipeline == True
+
+
+def test_zero_offload_optimizer_config_nvme_pipeline_buffer_count_validation():
+    with pytest.raises(ValidationError, match="requires buffer_count >= 12"):
+        DeepSpeedZeroOffloadOptimizerConfig(**{"device": "nvme", "pipeline_read": True})
+
+    with pytest.raises(ValidationError, match="requires buffer_count >= 12"):
+        DeepSpeedZeroOffloadOptimizerConfig(**{"device": "nvme", "pipeline_write": True})
+
+    with pytest.raises(ValidationError, match="requires buffer_count >= 16"):
+        DeepSpeedZeroOffloadOptimizerConfig(**{
+            "device": "nvme",
+            "pipeline_read": True,
+            "pipeline_write": True,
+        })
+
+    config = DeepSpeedZeroOffloadOptimizerConfig(**{
+        "device": "nvme",
+        "pipeline_read": True,
+        "buffer_count": 12,
+    })
+    assert config.pipeline == True
+
+    config = DeepSpeedZeroOffloadOptimizerConfig(**{
+        "device": "nvme",
+        "pipeline_write": True,
+        "buffer_count": 12,
+    })
+    assert config.pipeline == True
+
+    config = DeepSpeedZeroOffloadOptimizerConfig(**{
+        "device": "nvme",
+        "pipeline_read": True,
+        "pipeline_write": True,
+        "buffer_count": 16,
+    })
     assert config.pipeline == True

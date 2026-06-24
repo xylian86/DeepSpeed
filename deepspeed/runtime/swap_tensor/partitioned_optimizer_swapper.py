@@ -82,7 +82,12 @@ class PartitionedOptimizerSwapper(OptimizerSwapper):
         pinned_buffers = self.swap_buffer_manager.allocate(num_elems=aligned_numel,
                                                            count=required_buffer_count,
                                                            dtype=parameter.dtype)
-        assert pinned_buffers is not None
+        if pinned_buffers is None:
+            raise RuntimeError(
+                self.swap_buffer_manager.allocation_failure_message(
+                    requested_num_elems=aligned_numel,
+                    requested_count=required_buffer_count,
+                    owner='partitioned optimizer swap-in'))
         swap_info.swap_buffers = pinned_buffers.copy()
 
         self._start_timer(SWAP_IN_PARAM_TIMER)

@@ -184,13 +184,20 @@ class SwapBufferManager(object):
         self.num_elems = num_elems
         self.count = count
         self.dtype = dtype
+        self.element_size = torch.tensor([], dtype=dtype).element_size()
         self.all_buffers = [
-            get_accelerator().pin_memory(torch.zeros(num_elems, device='cpu', dtype=dtype), align_bytes=0)
+            get_accelerator().pin_memory(torch.empty(num_elems, device='cpu', dtype=dtype), align_bytes=0)
             for _ in range(count)
         ]
         self.free_buffer_index = [i for i in range(count)]
         self.used_buffer_index = {}
-        self.gigabytes = (self.all_buffers[0].element_size() * num_elems * count) / (1024**3)
+        self.total_bytes = self.element_size * num_elems * count
+        self.gigabytes = self.total_bytes / (1024**3)
+        self.num_allocations = 0
+        self.num_failed_allocations = 0
+        self.max_allocated_buffers = 0
+        self.max_requested_num_elems = 0
+        self.max_requested_count = 0
 
         if dist.get_rank() == 0:
             exclude_list = ['all_buffers']
@@ -199,7 +206,10 @@ class SwapBufferManager(object):
     def allocate(self, num_elems, count, dtype):
         assert dtype == self.dtype
         assert num_elems <= self.num_elems
+        self.max_requested_num_elems = max(self.max_requested_num_elems, num_elems)
+        self.max_requested_count = max(self.max_requested_count, count)
         if count > len(self.free_buffer_index):
+            self.num_failed_allocations += 1
             return None
 
         used_indices = self.free_buffer_index[-count:]
@@ -210,6 +220,8 @@ class SwapBufferManager(object):
             tmp_buffer = self.all_buffers[i].narrow(0, 0, num_elems)
             buffers.append(tmp_buffer)
             self.used_buffer_index[id(tmp_buffer)] = i
+        self.num_allocations += 1
+        self.max_allocated_buffers = max(self.max_allocated_buffers, len(self.used_buffer_index))
         return buffers
 
     def allocate_all(self, num_elems, dtype):
@@ -225,6 +237,36 @@ class SwapBufferManager(object):
         for b_id in buffer_ids:
             self.free_buffer_index.append(self.used_buffer_index[b_id])
             del (self.used_buffer_index[b_id])
+
+    def status(self):
+        return {
+            'buffer_num_elems': self.num_elems,
+            'buffer_count': self.count,
+            'free_buffer_count': len(self.free_buffer_index),
+            'used_buffer_count': len(self.used_buffer_index),
+            'element_size': self.element_size,
+            'total_bytes': self.total_bytes,
+            'num_allocations': self.num_allocations,
+            'num_failed_allocations': self.num_failed_allocations,
+            'max_allocated_buffers': self.max_allocated_buffers,
+            'max_requested_num_elems': self.max_requested_num_elems,
+            'max_requested_count': self.max_requested_count,
+        }
+
+    def allocation_failure_message(self, requested_num_elems, requested_count, owner):
+        status = self.status()
+        requested_bytes = requested_num_elems * requested_count * self.element_size
+        return (
+            f"SwapBufferManager could not allocate {requested_count} buffer(s) for {owner}: "
+            f"requested_num_elems={requested_num_elems}, "
+            f"requested_bytes={requested_bytes / (1024**3):.2f} GiB, "
+            f"free_buffer_count={status['free_buffer_count']}, "
+            f"used_buffer_count={status['used_buffer_count']}, "
+            f"buffer_count={status['buffer_count']}, "
+            f"buffer_num_elems={status['buffer_num_elems']}, "
+            f"pool_size={status['total_bytes'] / (1024**3):.2f} GiB. "
+            "Increase offload_optimizer.buffer_count, reduce zero_optimization.sub_group_size, "
+            "or disable optimizer offload pipelining.")
 
 
 def get_sized_buffer(buffer, num_elems):

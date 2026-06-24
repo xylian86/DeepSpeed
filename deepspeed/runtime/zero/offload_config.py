@@ -11,6 +11,9 @@ from typing import Optional
 from deepspeed.runtime.config_utils import DeepSpeedConfigModel, pp_int
 
 
+ADAM_OPTIMIZER_STATE_BUFFER_COUNT = 4
+
+
 class OffloadDeviceEnum(str, Enum):
     """ Enum for valid offload devices """
     none = "none"
@@ -103,7 +106,29 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
     def set_pipeline(self):
         pipeline = self.pipeline_read or self.pipeline_write
         self.__dict__["pipeline"] = pipeline
+        if self.device == OffloadDeviceEnum.nvme and pipeline:
+            min_buffer_count = self._minimum_pipeline_buffer_count()
+            if self.buffer_count < min_buffer_count:
+                raise ValueError(
+                    "NVMe optimizer offload with pipeline_read="
+                    f"{self.pipeline_read} and pipeline_write={self.pipeline_write} "
+                    f"requires buffer_count >= {min_buffer_count}; got {self.buffer_count}. "
+                    "Pipelined swapping can concurrently hold current swap-in buffers, "
+                    "next async swap-in buffers, previous async swap-out buffers, and "
+                    "write staging buffers. Increase buffer_count or disable optimizer "
+                    "offload pipelining.")
         return self
+
+    def _minimum_pipeline_buffer_count(self) -> int:
+        # Adam keeps parameter, gradient, momentum, and variance state in the
+        # optimizer swap path. Pipeline mode may hold multiple such groups at
+        # once, so the non-pipelined minimum is not sufficient.
+        sync_swap_in = ADAM_OPTIMIZER_STATE_BUFFER_COUNT
+        next_async_swap_in = ADAM_OPTIMIZER_STATE_BUFFER_COUNT if self.pipeline_read else 0
+        previous_async_swap_out = 2 * ADAM_OPTIMIZER_STATE_BUFFER_COUNT if self.pipeline_write else 0
+        write_staging = ADAM_OPTIMIZER_STATE_BUFFER_COUNT
+        return max(sync_swap_in + next_async_swap_in + write_staging,
+                   previous_async_swap_out + sync_swap_in + next_async_swap_in)
 
 
 class OffloadStateTypeEnum(str, Enum):

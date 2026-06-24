@@ -175,10 +175,16 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
         unpinned_tensors = param_info.get_unpinned_state_tensors()
 
         if len(unpinned_tensors) > 0:
-            new_alloc_buffers = self.swap_buffer_manager.allocate(num_elems=self._io_aligned_numel(param_info.numel()),
+            aligned_numel = self._io_aligned_numel(param_info.numel())
+            new_alloc_buffers = self.swap_buffer_manager.allocate(num_elems=aligned_numel,
                                                                   count=len(unpinned_tensors),
                                                                   dtype=param_info.dtype())
-            assert new_alloc_buffers is not None
+            if new_alloc_buffers is None:
+                raise RuntimeError(
+                    self.swap_buffer_manager.allocation_failure_message(
+                        requested_num_elems=aligned_numel,
+                        requested_count=len(unpinned_tensors),
+                        owner='pipelined optimizer swap-out staging'))
 
             allocated_buffers += new_alloc_buffers
             swap_buffers += new_alloc_buffers
@@ -212,8 +218,12 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
         allocated_buffers = self.swap_buffer_manager.allocate(num_elems=aligned_numel,
                                                               count=required_buffer_count,
                                                               dtype=parameter.dtype)
-        assert allocated_buffers is not None, \
-        "PipelinedOptimizerSwapper ran out of swap buffers, try increasing 'buffer_count'"
+        if allocated_buffers is None:
+            raise RuntimeError(
+                self.swap_buffer_manager.allocation_failure_message(
+                    requested_num_elems=aligned_numel,
+                    requested_count=required_buffer_count,
+                    owner='pipelined optimizer swap-in'))
 
         state_buffers = allocated_buffers[:num_swap_tensors]
         param_info.set_swap_buffers(state_buffers, aligned_numel)
