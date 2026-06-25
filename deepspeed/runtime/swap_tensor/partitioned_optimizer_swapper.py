@@ -67,8 +67,7 @@ class PartitionedOptimizerSwapper(OptimizerSwapper):
             return
         swap_info.release_memory()
 
-        self.swap_buffer_manager.free(swap_info.swap_buffers)
-        swap_info.swap_buffers = []
+        self._release_swap_info_buffers(swap_info)
 
     def swap_in_optimizer_state(self, parameter, async_parameter=None):
         swap_info = self._get_param_swap_info(parameter)
@@ -79,29 +78,35 @@ class PartitionedOptimizerSwapper(OptimizerSwapper):
 
         required_buffer_count = swap_info.num_tensors() + (1 if swap_info.has_gradients() else 0)
         aligned_numel = self._io_aligned_numel(swap_info.numel())
-        pinned_buffers = self.swap_buffer_manager.allocate(num_elems=aligned_numel,
-                                                           count=required_buffer_count,
-                                                           dtype=parameter.dtype)
-        if pinned_buffers is None:
+        lease = self.swap_buffer_manager.allocate_lease(num_elems=aligned_numel,
+                                                        count=required_buffer_count,
+                                                        dtype=parameter.dtype,
+                                                        owner='partitioned optimizer swap-in')
+        if lease is None:
             raise RuntimeError(
                 self.swap_buffer_manager.allocation_failure_message(
                     requested_num_elems=aligned_numel,
                     requested_count=required_buffer_count,
                     owner='partitioned optimizer swap-in'))
-        swap_info.swap_buffers = pinned_buffers.copy()
+        pinned_buffers = lease.buffers
+        self._set_swap_info_lease(swap_info, lease)
 
-        self._start_timer(SWAP_IN_PARAM_TIMER)
-        self._swap_in_parameter(aio_handle=self.aio_handle,
-                                parameter=parameter,
-                                dest_buffers=pinned_buffers[:swap_info.num_tensors()])
-        self._stop_timer(SWAP_IN_PARAM_TIMER)
-        self.timer_names.add(SWAP_IN_PARAM_TIMER)
+        try:
+            self._start_timer(SWAP_IN_PARAM_TIMER)
+            self._swap_in_parameter(aio_handle=self.aio_handle,
+                                    parameter=parameter,
+                                    dest_buffers=pinned_buffers[:swap_info.num_tensors()])
+            self._stop_timer(SWAP_IN_PARAM_TIMER)
+            self.timer_names.add(SWAP_IN_PARAM_TIMER)
 
-        if swap_info.has_gradients():
-            self._start_timer(SWAP_IN_GRADIENT_TIMER)
-            self._swap_in_gradients(aio_handle=self.aio_handle, parameter=parameter, dest_buffer=pinned_buffers[-1])
-            self._stop_timer(SWAP_IN_GRADIENT_TIMER)
-            self.timer_names.add(SWAP_IN_GRADIENT_TIMER)
+            if swap_info.has_gradients():
+                self._start_timer(SWAP_IN_GRADIENT_TIMER)
+                self._swap_in_gradients(aio_handle=self.aio_handle, parameter=parameter, dest_buffer=pinned_buffers[-1])
+                self._stop_timer(SWAP_IN_GRADIENT_TIMER)
+                self.timer_names.add(SWAP_IN_GRADIENT_TIMER)
+        except Exception:
+            self._release_swap_info_buffers(swap_info)
+            raise
 
     def _swap_out_optimizer_state(self, swap_info):
         pinned_tensors, pinned_paths = swap_info.get_swap_buffers_and_paths(True)
@@ -113,12 +118,25 @@ class PartitionedOptimizerSwapper(OptimizerSwapper):
 
         unpinned_tensors, unpinned_paths = swap_info.get_swap_buffers_and_paths(False)
         if len(unpinned_tensors) > 0:
-            pinned_buffers = self.swap_buffer_manager.allocate_all(num_elems=self.largest_numel, dtype=self.dtype)
-            self._swap_out_unpinned_tensors(aio_handle=self.aio_handle,
-                                            unpinned_tensors=unpinned_tensors,
-                                            dest_paths=unpinned_paths,
-                                            pinned_buffers=pinned_buffers)
-            swap_info.swap_buffers += pinned_buffers.copy()
+            staging_lease = self.staging_swap_buffer_manager.allocate_all_lease(
+                num_elems=self.largest_numel,
+                dtype=self.dtype,
+                owner='partitioned optimizer swap-out staging')
+            if staging_lease is None:
+                raise RuntimeError(
+                    self.staging_swap_buffer_manager.allocation_failure_message(
+                        requested_num_elems=self.largest_numel,
+                        requested_count=self.staging_swap_buffer_manager.count,
+                        owner='partitioned optimizer swap-out staging'))
+            try:
+                self._swap_out_unpinned_tensors(aio_handle=self.aio_handle,
+                                                unpinned_tensors=unpinned_tensors,
+                                                dest_paths=unpinned_paths,
+                                                pinned_buffers=staging_lease.buffers)
+            except Exception:
+                staging_lease.release()
+                raise
+            self._append_swap_info_lease(swap_info, staging_lease)
 
         self._stop_timer(WRITE_TIMER)
         self._log_timers([WRITE_TIMER])

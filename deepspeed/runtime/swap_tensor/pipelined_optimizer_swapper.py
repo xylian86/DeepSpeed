@@ -19,12 +19,13 @@ from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerSwapper
 
 class OptimizerSwapOp(object):
 
-    def __init__(self, aio_handle, read_op, param_info, allocated_buffers, state_buffers, num_ops):
+    def __init__(self, aio_handle, read_op, param_info, allocated_buffers, state_buffers, num_ops, buffer_leases=None):
         self.aio_handle = aio_handle
         self.read_op = read_op
         self.param_info = param_info
         self.allocated_buffers = allocated_buffers
         self.state_buffers = state_buffers
+        self.buffer_leases = buffer_leases or []
         self.wait_required = True
         self.num_ops = num_ops
 
@@ -35,6 +36,15 @@ class OptimizerSwapOp(object):
         assert self.wait_required
         assert self.aio_handle.wait() == self.num_ops
         self.wait_required = False
+
+    def release_buffers(self):
+        for lease in self.take_buffer_leases():
+            lease.release()
+
+    def take_buffer_leases(self):
+        buffer_leases = self.buffer_leases
+        self.buffer_leases = []
+        return buffer_leases
 
 
 SYNC_SWAP_IN = 'sync_swap_in'
@@ -161,7 +171,7 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
         self.swap_ops[swap_out_type].wait()
         for buffer in self.swap_ops[swap_out_type].state_buffers:
             buffer = torch.Tensor()
-        self.swap_buffer_manager.free(self.swap_ops[swap_out_type].allocated_buffers)
+        self.swap_ops[swap_out_type].release_buffers()
         self.swap_ops[swap_out_type] = None
 
     def _swap_out_optimizer_state(self, aio_handle, parameter, swap_in_op):
@@ -169,41 +179,53 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
 
         allocated_buffers = swap_in_op.allocated_buffers.copy()
         swap_buffers = swap_in_op.state_buffers.copy()
+        buffer_leases = swap_in_op.take_buffer_leases()
 
-        param_info = swap_in_op.param_info
-        self._update_param_state_info(param_info, parameter)
-        unpinned_tensors = param_info.get_unpinned_state_tensors()
+        try:
+            param_info = swap_in_op.param_info
+            self._update_param_state_info(param_info, parameter)
+            unpinned_tensors = param_info.get_unpinned_state_tensors()
 
-        if len(unpinned_tensors) > 0:
-            aligned_numel = self._io_aligned_numel(param_info.numel())
-            new_alloc_buffers = self.swap_buffer_manager.allocate(num_elems=aligned_numel,
-                                                                  count=len(unpinned_tensors),
-                                                                  dtype=param_info.dtype())
-            if new_alloc_buffers is None:
-                raise RuntimeError(
-                    self.swap_buffer_manager.allocation_failure_message(
-                        requested_num_elems=aligned_numel,
-                        requested_count=len(unpinned_tensors),
-                        owner='pipelined optimizer swap-out staging'))
+            if len(unpinned_tensors) > 0:
+                aligned_numel = self._io_aligned_numel(param_info.numel())
+                staging_lease = self.staging_swap_buffer_manager.allocate_lease(
+                    num_elems=aligned_numel,
+                    count=len(unpinned_tensors),
+                    dtype=param_info.dtype(),
+                    owner='pipelined optimizer swap-out staging')
+                if staging_lease is None:
+                    raise RuntimeError(
+                        self.staging_swap_buffer_manager.allocation_failure_message(
+                            requested_num_elems=aligned_numel,
+                            requested_count=len(unpinned_tensors),
+                            owner='pipelined optimizer swap-out staging'))
+                new_alloc_buffers = staging_lease.buffers
 
-            allocated_buffers += new_alloc_buffers
-            swap_buffers += new_alloc_buffers
+                allocated_buffers += new_alloc_buffers
+                swap_buffers += new_alloc_buffers
+                buffer_leases.append(staging_lease)
 
-            for pinned_dst, unpinned_src in zip(new_alloc_buffers, unpinned_tensors):
-                dst = get_sized_buffer(pinned_dst, unpinned_src.numel())
-                dst.data.copy_(unpinned_src.data)
+                for pinned_dst, unpinned_src in zip(new_alloc_buffers, unpinned_tensors):
+                    dst = get_sized_buffer(pinned_dst, unpinned_src.numel())
+                    dst.data.copy_(unpinned_src.data)
 
-        swap_paths = param_info.get_swap_paths()
-        assert len(swap_paths) == len(swap_buffers)
+            swap_paths = param_info.get_swap_paths()
+            assert len(swap_paths) == len(swap_buffers)
 
-        swap_out_tensors(aio_handle, swap_buffers, swap_paths)
+            swap_out_tensors(aio_handle, swap_buffers, swap_paths)
 
-        swap_out_op = OptimizerSwapOp(aio_handle=aio_handle,
-                                      param_info=param_info,
-                                      read_op=False,
-                                      allocated_buffers=allocated_buffers,
-                                      state_buffers=swap_buffers,
-                                      num_ops=len(swap_buffers))
+            swap_out_op = OptimizerSwapOp(aio_handle=aio_handle,
+                                          param_info=param_info,
+                                          read_op=False,
+                                          allocated_buffers=allocated_buffers,
+                                          state_buffers=swap_buffers,
+                                          num_ops=len(swap_buffers),
+                                          buffer_leases=buffer_leases)
+        except Exception:
+            for lease in buffer_leases:
+                if not lease.released:
+                    lease.release()
+            raise
 
         return swap_out_op
 
@@ -215,38 +237,45 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
         num_swap_tensors = param_info.num_tensors()
         required_buffer_count = num_swap_tensors + (1 if param_info.has_gradients() else 0)
         aligned_numel = self._io_aligned_numel(param_info.numel())
-        allocated_buffers = self.swap_buffer_manager.allocate(num_elems=aligned_numel,
-                                                              count=required_buffer_count,
-                                                              dtype=parameter.dtype)
-        if allocated_buffers is None:
+        lease = self.swap_buffer_manager.allocate_lease(num_elems=aligned_numel,
+                                                        count=required_buffer_count,
+                                                        dtype=parameter.dtype,
+                                                        owner='pipelined optimizer swap-in')
+        if lease is None:
             raise RuntimeError(
                 self.swap_buffer_manager.allocation_failure_message(
                     requested_num_elems=aligned_numel,
                     requested_count=required_buffer_count,
                     owner='pipelined optimizer swap-in'))
+        allocated_buffers = lease.buffers
 
-        state_buffers = allocated_buffers[:num_swap_tensors]
-        param_info.set_swap_buffers(state_buffers, aligned_numel)
+        try:
+            state_buffers = allocated_buffers[:num_swap_tensors]
+            param_info.set_swap_buffers(state_buffers, aligned_numel)
 
-        swap_buffers = state_buffers.copy()
-        swap_paths = param_info.get_swap_paths()
+            swap_buffers = state_buffers.copy()
+            swap_paths = param_info.get_swap_paths()
 
-        if param_info.has_gradients():
-            parameter.grad = allocated_buffers[-1].narrow(0, 0, param_info.numel())
-            if param_info.swapped_gradients:
-                swap_buffers += param_info.get_swap_gradient_buffers(parameter.grad)
-                swap_paths += param_info.get_swap_gradient_paths()
+            if param_info.has_gradients():
+                parameter.grad = allocated_buffers[-1].narrow(0, 0, param_info.numel())
+                if param_info.swapped_gradients:
+                    swap_buffers += param_info.get_swap_gradient_buffers(parameter.grad)
+                    swap_paths += param_info.get_swap_gradient_paths()
 
-        swap_in_tensors(aio_handle, swap_buffers, swap_paths)
+            swap_in_tensors(aio_handle, swap_buffers, swap_paths)
 
-        if param_info.unswapped_gradients:
-            self._retrieve_unswapped_grad_partitions(swap_info=param_info, dest_buffer=parameter.grad)
+            if param_info.unswapped_gradients:
+                self._retrieve_unswapped_grad_partitions(swap_info=param_info, dest_buffer=parameter.grad)
 
-        swap_in_op = OptimizerSwapOp(aio_handle=aio_handle,
-                                     param_info=param_info,
-                                     read_op=True,
-                                     allocated_buffers=allocated_buffers,
-                                     state_buffers=state_buffers,
-                                     num_ops=len(swap_buffers))
+            swap_in_op = OptimizerSwapOp(aio_handle=aio_handle,
+                                         param_info=param_info,
+                                         read_op=True,
+                                         allocated_buffers=allocated_buffers,
+                                         state_buffers=state_buffers,
+                                         num_ops=len(swap_buffers),
+                                         buffer_leases=[lease])
+        except Exception:
+            lease.release()
+            raise
 
         return swap_in_op

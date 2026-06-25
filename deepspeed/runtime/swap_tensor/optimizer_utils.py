@@ -18,6 +18,21 @@ from deepspeed.runtime.swap_tensor.utils import SwapBufferManager, SwapBufferPoo
 from deepspeed.accelerator import get_accelerator
 
 
+OPTIMIZER_SWAP_STAGING_BUFFER_COUNT = 4
+
+
+def split_swap_buffer_counts(swap_config):
+    if not getattr(swap_config, 'pipeline', False):
+        return swap_config.buffer_count, 0
+
+    staging_buffer_count = OPTIMIZER_SWAP_STAGING_BUFFER_COUNT
+    state_buffer_count = swap_config.buffer_count - staging_buffer_count
+    if state_buffer_count <= 0:
+        raise ValueError(
+            f"Pipeline swap requires more than {staging_buffer_count} total buffers, got {swap_config.buffer_count}")
+    return state_buffer_count, staging_buffer_count
+
+
 class FlattenedTensorSwapInfo(object):
 
     def __init__(self, path, length, offset):
@@ -55,6 +70,7 @@ class OptimizerStateSwapInfo(object):
         self.tensor_device = parameter.device
         self.has_state_tensors = False
         self.swap_buffers = []
+        self.swap_buffer_leases = []
         self._add_tensors([parameter])
 
     def numel(self):
@@ -182,9 +198,18 @@ class OptimizerSwapper(object):
         # Swap buffer management
         self.largest_numel = self._io_aligned_numel(largest_numel)
         self.dtype = dtype
+        state_buffer_count, staging_buffer_count = split_swap_buffer_counts(swap_config)
         self.swap_buffer_manager = SwapBufferManager(num_elems=self.largest_numel,
-                                                     count=swap_config.buffer_count,
-                                                     dtype=dtype)
+                                                     count=state_buffer_count,
+                                                     dtype=dtype,
+                                                     name='optimizer_state')
+        self.staging_swap_buffer_manager = self.swap_buffer_manager
+        if staging_buffer_count > 0:
+            self.staging_swap_buffer_manager = SwapBufferManager(num_elems=self.largest_numel,
+                                                                 count=staging_buffer_count,
+                                                                 dtype=dtype,
+                                                                 name='optimizer_staging')
+        self.gradient_buffer_lease = None
 
         # Timers
         self.timers = timers
@@ -194,10 +219,30 @@ class OptimizerSwapper(object):
         self.print_exclude_list = [
             'optimizer',
             'swap_buffer_manager',
+            'staging_swap_buffer_manager',
+            'gradient_buffer_lease',
             'swap_params_info',
             'timers',
             'timer_names',
         ]
+
+    def _set_swap_info_lease(self, swap_info, lease):
+        swap_info.swap_buffer_leases = [lease]
+        swap_info.swap_buffers = lease.buffers.copy()
+
+    def _append_swap_info_lease(self, swap_info, lease):
+        swap_info.swap_buffer_leases.append(lease)
+        swap_info.swap_buffers += lease.buffers.copy()
+
+    def _release_swap_info_buffers(self, swap_info):
+        leases = swap_info.swap_buffer_leases
+        if leases:
+            for lease in leases:
+                lease.release()
+            swap_info.swap_buffer_leases = []
+        elif swap_info.swap_buffers:
+            self.swap_buffer_manager.free(swap_info.swap_buffers)
+        swap_info.swap_buffers = []
 
     def purge_state(self):
         for swap_info in self.swap_params_info.values():
@@ -227,7 +272,11 @@ class OptimizerSwapper(object):
         if gradient_swapper.has_buffers():
             self._start_timer(SWAP_OUT_GRADIENT_TIMER)
             pinned_buffers = gradient_swapper.release_buffers()
-            self.swap_buffer_manager.free(pinned_buffers)
+            if self.gradient_buffer_lease is not None:
+                self.gradient_buffer_lease.release()
+                self.gradient_buffer_lease = None
+            else:
+                self.staging_swap_buffer_manager.free(pinned_buffers)
             self._stop_timer(SWAP_OUT_GRADIENT_TIMER)
             self.timer_names.add(SWAP_OUT_GRADIENT_TIMER)
             self.timer_names.update(gradient_swapper.get_timer_names())
@@ -257,9 +306,23 @@ class OptimizerSwapper(object):
 
         if len(swappable_tensors) > 0:
             if not gradient_swapper.has_buffers():
-                pinned_buffers = self.swap_buffer_manager.allocate_all(num_elems=self.largest_numel, dtype=self.dtype)
+                lease = self.staging_swap_buffer_manager.allocate_all_lease(num_elems=self.largest_numel,
+                                                                            dtype=self.dtype,
+                                                                            owner='gradient swap-out staging')
+                if lease is None:
+                    raise RuntimeError(
+                        self.staging_swap_buffer_manager.allocation_failure_message(
+                            requested_num_elems=self.largest_numel,
+                            requested_count=self.staging_swap_buffer_manager.count,
+                            owner='gradient swap-out staging'))
 
-                gradient_swapper.add_buffers(pinned_buffers)
+                self.gradient_buffer_lease = lease
+                try:
+                    gradient_swapper.add_buffers(lease.buffers)
+                except Exception:
+                    self.gradient_buffer_lease = None
+                    lease.release()
+                    raise
 
             swappable_paths = swap_info.get_or_create_gradient_paths(swappable_offsets, swappable_lengths)
 
@@ -276,41 +339,53 @@ class OptimizerSwapper(object):
 
         fp32_swap_paths = self._get_swap_paths(parameters=fp32_parameters, num_elems=fp16_num_elems)
 
-        fp32_pinned_buffers = self.swap_buffer_manager.allocate_all(num_elems=self.largest_numel, dtype=self.dtype)
+        fp32_pinned_lease = self.staging_swap_buffer_manager.allocate_all_lease(
+            num_elems=self.largest_numel,
+            dtype=self.dtype,
+            owner='initialize swapped fp16 params')
+        if fp32_pinned_lease is None:
+            raise RuntimeError(
+                self.staging_swap_buffer_manager.allocation_failure_message(
+                    requested_num_elems=self.largest_numel,
+                    requested_count=self.staging_swap_buffer_manager.count,
+                    owner='initialize swapped fp16 params'))
+        fp32_pinned_buffers = fp32_pinned_lease.buffers
 
-        fp16_buffer_numel = [buf.numel() for buf in fp16_pinned_buffers]
-        assert all([numel >= self.largest_numel for numel in fp16_buffer_numel]), \
-        f"numel of fp16 buffers {fp16_buffer_numel} is too small for initializing fp32 params {self.largest_numel}"
+        try:
+            fp16_buffer_numel = [buf.numel() for buf in fp16_pinned_buffers]
+            assert all([numel >= self.largest_numel for numel in fp16_buffer_numel]), \
+            f"numel of fp16 buffers {fp16_buffer_numel} is too small for initializing fp32 params {self.largest_numel}"
 
-        fp32_swap_buffers = SwapBufferPool(fp32_pinned_buffers)
-        fp16_swap_buffers = SwapBufferPool(fp16_pinned_buffers)
+            fp32_swap_buffers = SwapBufferPool(fp32_pinned_buffers)
+            fp16_swap_buffers = SwapBufferPool(fp16_pinned_buffers)
 
-        curr_index = 0
-        while curr_index < len(fp32_parameters):
-            fp16_pinned_tensors = self._swap_in_fp16_params(aio_handle=aio_handle,
-                                                            fp16_num_elems=fp16_num_elems[curr_index:],
-                                                            fp16_partitions_info=fp16_partitions_info[curr_index:],
-                                                            fp16_swap_buffers=fp16_swap_buffers)
+            curr_index = 0
+            while curr_index < len(fp32_parameters):
+                fp16_pinned_tensors = self._swap_in_fp16_params(aio_handle=aio_handle,
+                                                                fp16_num_elems=fp16_num_elems[curr_index:],
+                                                                fp16_partitions_info=fp16_partitions_info[curr_index:],
+                                                                fp16_swap_buffers=fp16_swap_buffers)
 
-            if dist.get_rank() == 0 and SWAPPER_DEBUG_MODE:
-                for i, tensor in enumerate(fp16_pinned_tensors):
-                    true_index = curr_index + i
-                    logger.info(
-                        f'swap_in_fp16_param: fp32_id = {OptimizerSwapper.parameter_id(fp32_parameters[true_index])} index = {true_index} orig_num_elem = {fp16_num_elems[true_index]}, swap_num_elem = {fp16_pinned_tensors[i].numel()}'
-                    )
+                if dist.get_rank() == 0 and SWAPPER_DEBUG_MODE:
+                    for i, tensor in enumerate(fp16_pinned_tensors):
+                        true_index = curr_index + i
+                        logger.info(
+                            f'swap_in_fp16_param: fp32_id = {OptimizerSwapper.parameter_id(fp32_parameters[true_index])} index = {true_index} orig_num_elem = {fp16_num_elems[true_index]}, swap_num_elem = {fp16_pinned_tensors[i].numel()}'
+                        )
 
-            swap_out_count = self._swap_out_fp16_params(aio_handle=aio_handle,
-                                                        fp32_swap_paths=fp32_swap_paths[curr_index:],
-                                                        fp32_swap_buffers=fp32_swap_buffers,
-                                                        fp16_pinned_tensors=fp16_pinned_tensors)
-            assert swap_out_count == len(fp16_pinned_tensors), \
-            f"{swap_out_count} does not match {len(fp16_pinned_tensors)}"
+                swap_out_count = self._swap_out_fp16_params(aio_handle=aio_handle,
+                                                            fp32_swap_paths=fp32_swap_paths[curr_index:],
+                                                            fp32_swap_buffers=fp32_swap_buffers,
+                                                            fp16_pinned_tensors=fp16_pinned_tensors)
+                assert swap_out_count == len(fp16_pinned_tensors), \
+                f"{swap_out_count} does not match {len(fp16_pinned_tensors)}"
 
-            fp16_swap_buffers.reset()
-            fp32_swap_buffers.reset()
-            curr_index += swap_out_count
+                fp16_swap_buffers.reset()
+                fp32_swap_buffers.reset()
+                curr_index += swap_out_count
 
-        self.swap_buffer_manager.free(fp32_pinned_buffers)
+        finally:
+            fp32_pinned_lease.release()
 
     def _swap_in_fp16_params(self, aio_handle, fp16_num_elems, fp16_partitions_info, fp16_swap_buffers):
         assert len(fp16_num_elems) > 0
@@ -375,21 +450,31 @@ class OptimizerSwapper(object):
         SWAP_INIT_TIMER = "swap_init_write"
         self._start_timer(SWAP_INIT_TIMER)
 
-        pinned_buffers = self.swap_buffer_manager.allocate_all(num_elems=self.largest_numel, dtype=self.dtype)
-        assert pinned_buffers is not None
+        pinned_lease = self.staging_swap_buffer_manager.allocate_all_lease(num_elems=self.largest_numel,
+                                                                           dtype=self.dtype,
+                                                                           owner='initialize optimizer params')
+        if pinned_lease is None:
+            raise RuntimeError(
+                self.staging_swap_buffer_manager.allocation_failure_message(
+                    requested_num_elems=self.largest_numel,
+                    requested_count=self.staging_swap_buffer_manager.count,
+                    owner='initialize optimizer params'))
+        pinned_buffers = pinned_lease.buffers
 
-        self._swap_out_unpinned_tensors(aio_handle=aio_handle,
-                                        unpinned_tensors=src_tensors,
-                                        dest_paths=swap_paths,
-                                        pinned_buffers=pinned_buffers)
+        try:
+            self._swap_out_unpinned_tensors(aio_handle=aio_handle,
+                                            unpinned_tensors=src_tensors,
+                                            dest_paths=swap_paths,
+                                            pinned_buffers=pinned_buffers)
 
-        if dist.get_rank() == 0 and SWAPPER_DEBUG_MODE:
-            for i, tensor in enumerate(src_tensors):
-                logger.info(
-                    f'copy_in_fp16_param: fp32_id = {OptimizerSwapper.parameter_id(parameters[i])} index = {i}, swap_num_elem = {src_tensors[i].numel()}'
-                )
+            if dist.get_rank() == 0 and SWAPPER_DEBUG_MODE:
+                for i, tensor in enumerate(src_tensors):
+                    logger.info(
+                        f'copy_in_fp16_param: fp32_id = {OptimizerSwapper.parameter_id(parameters[i])} index = {i}, swap_num_elem = {src_tensors[i].numel()}'
+                    )
 
-        self.swap_buffer_manager.free(pinned_buffers)
+        finally:
+            pinned_lease.release()
 
         self._stop_timer(SWAP_INIT_TIMER)
         self._log_timers([SWAP_INIT_TIMER])

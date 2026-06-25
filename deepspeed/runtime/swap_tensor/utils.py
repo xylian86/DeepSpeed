@@ -178,9 +178,34 @@ class SwapBufferPool(object):
         return self.buffers[:self.current_index + 1]
 
 
+class SwapBufferLease(object):
+
+    def __init__(self, manager, buffers, owner):
+        self.manager = manager
+        self.buffers = buffers
+        self.owner = owner
+        self.released = False
+
+    def release(self):
+        if self.released:
+            raise RuntimeError(f"Swap buffer lease for {self.owner} was released more than once")
+        self.manager.free(self.buffers)
+        self.released = True
+
+    def __len__(self):
+        return len(self.buffers)
+
+    def __iter__(self):
+        return iter(self.buffers)
+
+    def __getitem__(self, index):
+        return self.buffers[index]
+
+
 class SwapBufferManager(object):
 
-    def __init__(self, num_elems, count, dtype):
+    def __init__(self, num_elems, count, dtype, name='swap_buffer'):
+        self.name = name
         self.num_elems = num_elems
         self.count = count
         self.dtype = dtype
@@ -208,7 +233,7 @@ class SwapBufferManager(object):
         assert num_elems <= self.num_elems
         self.max_requested_num_elems = max(self.max_requested_num_elems, num_elems)
         self.max_requested_count = max(self.max_requested_count, count)
-        if count > len(self.free_buffer_index):
+        if count <= 0 or count > len(self.free_buffer_index):
             self.num_failed_allocations += 1
             return None
 
@@ -224,8 +249,20 @@ class SwapBufferManager(object):
         self.max_allocated_buffers = max(self.max_allocated_buffers, len(self.used_buffer_index))
         return buffers
 
+    def allocate_lease(self, num_elems, count, dtype, owner):
+        buffers = self.allocate(num_elems=num_elems, count=count, dtype=dtype)
+        if buffers is None:
+            return None
+        return SwapBufferLease(manager=self, buffers=buffers, owner=owner)
+
     def allocate_all(self, num_elems, dtype):
         return self.allocate(num_elems=num_elems, count=len(self.free_buffer_index), dtype=dtype)
+
+    def allocate_all_lease(self, num_elems, dtype, owner):
+        return self.allocate_lease(num_elems=num_elems,
+                                   count=len(self.free_buffer_index),
+                                   dtype=dtype,
+                                   owner=owner)
 
     def free(self, buffers):
         buffer_ids = []
@@ -241,6 +278,7 @@ class SwapBufferManager(object):
     def status(self):
         return {
             'buffer_num_elems': self.num_elems,
+            'name': self.name,
             'buffer_count': self.count,
             'free_buffer_count': len(self.free_buffer_index),
             'used_buffer_count': len(self.used_buffer_index),
@@ -257,7 +295,7 @@ class SwapBufferManager(object):
         status = self.status()
         requested_bytes = requested_num_elems * requested_count * self.element_size
         return (
-            f"SwapBufferManager could not allocate {requested_count} buffer(s) for {owner}: "
+            f"SwapBufferManager[{self.name}] could not allocate {requested_count} buffer(s) for {owner}: "
             f"requested_num_elems={requested_num_elems}, "
             f"requested_bytes={requested_bytes / (1024**3):.2f} GiB, "
             f"free_buffer_count={status['free_buffer_count']}, "
