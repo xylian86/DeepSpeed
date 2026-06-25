@@ -79,6 +79,7 @@ from deepspeed.utils import groups
 from deepspeed.utils import logger, log_dist, log_dist_once, instrument_w_nvtx
 from deepspeed.utils.torch import required_torch_version
 from deepspeed.utils.z3_leaf_module import apply_zero_leaf_module_config
+from deepspeed.runtime.zero.superrl_sync import apply_superrl_sync_module_config
 from deepspeed.utils.timer import NoopTimer, ThroughputTimer, SynchronizedWallClockTimer, \
     FORWARD_MICRO_TIMER, BACKWARD_MICRO_TIMER, BACKWARD_INNER_MICRO_TIMER, BACKWARD_REDUCE_MICRO_TIMER, \
     STEP_MICRO_TIMER, \
@@ -1144,6 +1145,9 @@ class DeepSpeedEngine(Module):
     def superrl_io_config(self):
         return self._config.superrl_io_config
 
+    def superrl_sync_config(self):
+        return self._config.superrl_sync_config
+
     def zenflow_config(self):
         return self._config.zero_config.zenflow
 
@@ -1402,6 +1406,7 @@ class DeepSpeedEngine(Module):
     def _configure_distributed_model(self, model):
         self._set_client_model(model)
         apply_zero_leaf_module_config(self.module, getattr(self._config.zero_config, "leaf_module", None))
+        apply_superrl_sync_module_config(self.module, self.superrl_sync_config())
         is_zero_init_model = self.zero_optimization_partition_weights() and any(
             [hasattr(param, "ds_id") for param in self.module.parameters()])
 
