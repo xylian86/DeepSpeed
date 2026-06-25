@@ -205,7 +205,8 @@ class OptimizerSwapper(object):
         self.swap_buffer_manager = SwapBufferManager(num_elems=self.largest_numel,
                                                      count=state_buffer_count,
                                                      dtype=dtype,
-                                                     name='optimizer_state')
+                                                     name='optimizer_state',
+                                                     lazy=staging_buffer_count > 0)
         self.staging_swap_buffer_manager = self.swap_buffer_manager
         if staging_buffer_count > 0:
             staging_buffer_numel = self._staging_buffer_numel(swap_config)

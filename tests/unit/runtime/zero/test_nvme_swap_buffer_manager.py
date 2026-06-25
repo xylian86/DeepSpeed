@@ -97,6 +97,41 @@ def test_swap_buffer_manager_reports_allocation_state(monkeypatch):
     assert manager.status()["free_buffer_count"] == 2
 
 
+def test_swap_buffer_manager_lazy_slots_allocate_on_demand(monkeypatch):
+    _patch_swap_buffer_manager_deps(monkeypatch)
+
+    real_empty = swap_utils.torch.empty
+    empty_calls = []
+
+    def tracked_empty(*args, **kwargs):
+        empty_calls.append((args, kwargs))
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(swap_utils.torch, "empty", tracked_empty)
+
+    manager = swap_utils.SwapBufferManager(num_elems=8, count=2, dtype=torch.float32, lazy=True)
+    element_size = torch.tensor([], dtype=torch.float32).element_size()
+
+    assert len(empty_calls) == 0
+    assert manager.status()["total_bytes"] == 0
+    assert manager.status()["capacity_bytes"] == 8 * 2 * element_size
+
+    buffers = manager.allocate(num_elems=4, count=1, dtype=torch.float32)
+    assert buffers is not None
+    assert len(empty_calls) == 1
+    assert manager.status()["total_bytes"] == 4 * element_size
+    assert manager.status()["used_requested_bytes"] == 4 * element_size
+    assert manager.status()["num_buffer_allocations"] == 1
+    manager.free(buffers)
+
+    reused_buffers = manager.allocate(num_elems=2, count=1, dtype=torch.float32)
+    assert reused_buffers is not None
+    assert len(empty_calls) == 1
+    assert manager.status()["total_bytes"] == 4 * element_size
+    assert manager.status()["used_requested_bytes"] == 2 * element_size
+    manager.free(reused_buffers)
+
+
 def test_swap_buffer_lease_releases_once(monkeypatch):
     _patch_swap_buffer_manager_deps(monkeypatch)
 
