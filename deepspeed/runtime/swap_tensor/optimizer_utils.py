@@ -13,7 +13,7 @@ from deepspeed import comm as dist
 from deepspeed.utils.logging import logger
 from deepspeed.runtime.swap_tensor.constants import *
 from deepspeed.runtime.swap_tensor.utils import swap_in_tensors, swap_out_tensors, \
-    MIN_AIO_BYTES, AIO_ALIGNED_BYTES, get_sized_buffers
+    MIN_AIO_BYTES, AIO_ALIGNED_BYTES, get_sized_buffers, print_rank_0
 from deepspeed.runtime.swap_tensor.utils import SwapBufferManager, SwapBufferPool
 from deepspeed.accelerator import get_accelerator
 
@@ -298,6 +298,16 @@ class OptimizerSwapper(object):
     def log_timers(self):
         if self.timer_names:
             self._log_timers(list(self.timer_names), force=True)
+        self._log_swap_buffer_summary()
+
+    def _log_swap_buffer_summary(self):
+        managers = [self.swap_buffer_manager]
+        if self.staging_swap_buffer_manager is not self.swap_buffer_manager:
+            managers.append(self.staging_swap_buffer_manager)
+
+        summary = "Optimizer swap buffer summary: " + " | ".join([manager.summary() for manager in managers])
+        logger.info(summary)
+        print_rank_0(summary, force=True)
 
     def pre_backward(self):
         self.init_timers()

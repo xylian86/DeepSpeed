@@ -401,6 +401,20 @@ class SwapBufferManager(object):
             'max_requested_bytes': self.max_requested_bytes,
         }
 
+    def summary(self):
+        status = self.status()
+        return (
+            f"{self.name}: pinned={status['pinned_bytes'] / (1024**3):.2f} GiB, "
+            f"capacity={status['capacity_bytes'] / (1024**3):.2f} GiB, "
+            f"max_pinned={status['max_pinned_bytes'] / (1024**3):.2f} GiB, "
+            f"used_requested={status['used_requested_bytes'] / (1024**3):.2f} GiB, "
+            f"max_requested_in_use={status['max_requested_in_use_bytes'] / (1024**3):.2f} GiB, "
+            f"buffer_allocations={status['num_buffer_allocations']}, "
+            f"buffer_reallocations={status['num_buffer_reallocations']}, "
+            f"allocations={status['num_allocations']}, "
+            f"failed_allocations={status['num_failed_allocations']}, "
+            f"pin_memory_time={status['pin_memory_time_sec']:.3f} sec")
+
     def allocation_failure_message(self, requested_num_elems, requested_count, owner):
         status = self.status()
         requested_bytes = requested_num_elems * requested_count * self.element_size

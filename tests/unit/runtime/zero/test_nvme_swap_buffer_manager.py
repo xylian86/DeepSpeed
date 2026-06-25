@@ -132,6 +132,26 @@ def test_swap_buffer_manager_lazy_slots_allocate_on_demand(monkeypatch):
     manager.free(reused_buffers)
 
 
+def test_swap_buffer_manager_summary_reports_lifecycle_counters(monkeypatch):
+    _patch_swap_buffer_manager_deps(monkeypatch)
+
+    manager = swap_utils.SwapBufferManager(num_elems=8, count=2, dtype=torch.float32, lazy=True)
+    buffers = manager.allocate(num_elems=4, count=1, dtype=torch.float32)
+    assert buffers is not None
+
+    summary = manager.summary()
+    assert "swap_buffer:" in summary
+    assert "pinned=" in summary
+    assert "capacity=" in summary
+    assert "max_pinned=" in summary
+    assert "max_requested_in_use=" in summary
+    assert "buffer_allocations=1" in summary
+    assert "buffer_reallocations=0" in summary
+    assert "failed_allocations=0" in summary
+
+    manager.free(buffers)
+
+
 def test_swap_buffer_lease_releases_once(monkeypatch):
     _patch_swap_buffer_manager_deps(monkeypatch)
 
