@@ -9,6 +9,7 @@ Functionality of swapping optimizer tensors to/from (NVMe) storage devices.
 import os
 
 from deepspeed.ops.op_builder import AsyncIOBuilder
+from deepspeed.ops.op_builder import GDSBuilder
 from deepspeed import comm as dist
 import torch
 
@@ -16,6 +17,7 @@ from deepspeed.runtime.swap_tensor.constants import *
 from deepspeed.runtime.swap_tensor.utils import swap_in_tensors, swap_out_tensors, print_object, print_rank_0
 from deepspeed.runtime.swap_tensor.async_swapper import AsyncTensorSwapper
 from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerSwapper
+from deepspeed.accelerator import get_accelerator
 
 
 class OptimizerSwapOp(object):
@@ -262,27 +264,28 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
             unpinned_tensors = param_info.get_unpinned_state_tensors()
 
             if len(unpinned_tensors) > 0:
-                _, unpinned_paths = param_info.get_swap_buffers_and_paths(False)
+                _, unpinned_paths, unpinned_offsets = param_info.get_swap_buffers_and_paths(False)
                 staging_lease = self._allocate_staging_lease(owner='pipelined optimizer swap-out staging')
                 try:
                     self._swap_out_unpinned_tensors(aio_handle=aio_handle,
                                                     unpinned_tensors=unpinned_tensors,
                                                     dest_paths=unpinned_paths,
+                                                    dest_offsets=unpinned_offsets,
                                                     pinned_buffers=staging_lease.buffers)
                 finally:
                     staging_lease.release()
 
-            swap_buffers, swap_paths = param_info.get_swap_buffers_and_paths(True)
+            swap_buffers, swap_paths, swap_offsets = param_info.get_swap_buffers_and_paths(True)
             assert len(swap_paths) == len(swap_buffers)
 
-            swap_out_tensors(aio_handle, swap_buffers, swap_paths)
+            num_swap_ops = swap_out_tensors(aio_handle, swap_buffers, swap_paths, swap_offsets)
 
             swap_out_op = OptimizerSwapOp(aio_handle=aio_handle,
                                           param_info=param_info,
                                           read_op=False,
                                           allocated_buffers=allocated_buffers,
                                           state_buffers=swap_buffers,
-                                          num_ops=len(swap_buffers),
+                                          num_ops=num_swap_ops,
                                           buffer_leases=buffer_leases)
         except Exception:
             for lease in buffer_leases:
@@ -318,14 +321,16 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
 
             swap_buffers = state_buffers.copy()
             swap_paths = param_info.get_swap_paths()
+            swap_offsets = param_info.get_swap_offsets()
 
             if param_info.has_gradients():
                 parameter.grad = allocated_buffers[-1].narrow(0, 0, param_info.numel())
                 if param_info.swapped_gradients:
                     swap_buffers += param_info.get_swap_gradient_buffers(parameter.grad)
                     swap_paths += param_info.get_swap_gradient_paths()
+                    swap_offsets += param_info.get_swap_gradient_offsets()
 
-            swap_in_tensors(aio_handle, swap_buffers, swap_paths)
+            num_swap_ops = swap_in_tensors(aio_handle, swap_buffers, swap_paths, swap_offsets)
 
             if param_info.unswapped_gradients:
                 self._retrieve_unswapped_grad_partitions(swap_info=param_info, dest_buffer=parameter.grad)
@@ -335,10 +340,68 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
                                          read_op=True,
                                          allocated_buffers=allocated_buffers,
                                          state_buffers=state_buffers,
-                                         num_ops=len(swap_buffers),
+                                         num_ops=num_swap_ops,
                                          buffer_leases=[lease])
         except Exception:
             lease.release()
             raise
 
         return swap_in_op
+
+
+class SuperRLPipelinedGDSOptimizerSwapper(PipelinedOptimizerSwapper):
+
+    def __init__(self, swap_config, aio_config, base_folder, optimizer, largest_numel, device, dtype, timers):
+        gds_op = GDSBuilder().load(verbose=False)
+        self.write_aio_handle = gds_op.gds_handle(block_size=aio_config[AIO_BLOCK_SIZE],
+                                                  queue_depth=aio_config[AIO_QUEUE_DEPTH],
+                                                  single_submit=aio_config[AIO_SINGLE_SUBMIT],
+                                                  overlap_events=aio_config[AIO_OVERLAP_EVENTS],
+                                                  intra_op_parallelism=aio_config[AIO_INTRA_OP_PARALLELISM])
+
+        self.read_aio_handle = gds_op.gds_handle(block_size=aio_config[AIO_BLOCK_SIZE],
+                                                 queue_depth=aio_config[AIO_QUEUE_DEPTH],
+                                                 single_submit=aio_config[AIO_SINGLE_SUBMIT],
+                                                 overlap_events=aio_config[AIO_OVERLAP_EVENTS],
+                                                 intra_op_parallelism=aio_config[AIO_INTRA_OP_PARALLELISM])
+
+        OptimizerSwapper.__init__(self,
+                                  swap_config=swap_config,
+                                  aio_config=aio_config,
+                                  base_folder=base_folder,
+                                  optimizer=optimizer,
+                                  largest_numel=largest_numel,
+                                  device=device,
+                                  dtype=dtype,
+                                  timers=timers,
+                                  buffer_device=get_accelerator().current_device_name(),
+                                  pin_memory_fn=self._pin_device_buffer,
+                                  unpin_memory_fn=self._unpin_device_buffer)
+
+        self.gradient_swapper = AsyncTensorSwapper(aio_handle=self.write_aio_handle,
+                                                   numel_alignment=self.numel_alignment,
+                                                   timers=self.timers)
+
+        self.async_swap_in = True
+        self.async_swap_out = True
+
+        self.swap_ops = {SYNC_SWAP_IN: None, ASYNC_SWAP_IN: None, SYNC_SWAP_OUT: None, ASYNC_SWAP_OUT: None}
+        self.pipeline_occupancy_events = 0
+        self.pipeline_occupancy_log_enabled = os.environ.get(PIPELINE_OCCUPANCY_LOG_ENV, '').lower() in [
+            '1', 'true', 'yes', 'on'
+        ]
+
+        self.print_exclude_list += [
+            'gradient_swapper', 'read_aio_handle', 'write_aio_handle', 'swap_ops', 'pipeline_occupancy_events',
+            'pipeline_occupancy_log_enabled', 'print_exclude_list'
+        ]
+
+        if dist.get_rank() == 0:
+            print_object(obj=self, name='SuperRLPipelinedGDSOptimizerSwapper', exclude_list=self.print_exclude_list)
+
+    def _pin_device_buffer(self, buffer):
+        self.read_aio_handle.pin_device_tensor(buffer)
+        return buffer
+
+    def _unpin_device_buffer(self, buffer):
+        self.read_aio_handle.unpin_device_tensor(buffer)

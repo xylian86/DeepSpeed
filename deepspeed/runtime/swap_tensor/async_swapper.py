@@ -9,8 +9,7 @@ import torch
 
 from deepspeed import comm as dist
 from deepspeed.utils.logging import logger
-from deepspeed.runtime.swap_tensor.utils import swap_out_tensors, SwapBuffer
-from deepspeed.accelerator import get_accelerator
+from deepspeed.runtime.swap_tensor.utils import is_direct_io_buffer, swap_out_tensors, SwapBuffer
 
 INVALID_BUFFER_INDEX = -1
 ASYNC_SWAPPER_WAIT_TIMER = 'async_swap_gradient_wait'
@@ -38,7 +37,7 @@ class AsyncTensorSwapper(object):
 
     def add_buffers(self, buffer_list):
         assert len(self.all_buffers) == 0
-        assert all([get_accelerator().is_pinned(buffer) for buffer in buffer_list])
+        assert all([is_direct_io_buffer(buffer) for buffer in buffer_list])
         dtype = buffer_list[0].dtype
         assert all([buffer.dtype == dtype for buffer in buffer_list])
 
@@ -65,9 +64,13 @@ class AsyncTensorSwapper(object):
 
         return pinned_buffers
 
-    def swap_out_tensors(self, tensor_list, path_list):
-        for tensor, swap_path in zip(tensor_list, path_list):
-            self._swap_out_tensor(tensor, swap_path)
+    def swap_out_tensors(self, tensor_list, path_list, offset_list=None):
+        if offset_list is None:
+            offset_list = [0] * len(tensor_list)
+        assert len(tensor_list) == len(path_list)
+        assert len(tensor_list) == len(offset_list)
+        for tensor, swap_path, swap_offset in zip(tensor_list, path_list, offset_list):
+            self._swap_out_tensor(tensor, swap_path, swap_offset)
 
     def _report_statistics(self, message):
         if dist.get_rank() == 0:
@@ -75,7 +78,7 @@ class AsyncTensorSwapper(object):
             swapped_GB = (self.num_elements_swapped * element_size) / (1024**3)
             logger.debug(f'{message} num_elems = {self.num_elements_swapped}, {swapped_GB:5.2f} GB')
 
-    def _swap_out_tensor(self, tensor, swap_path):
+    def _swap_out_tensor(self, tensor, swap_path, swap_offset):
         assert len(self.all_buffers) > 0
 
         aligned_numel = self._io_aligned_numel(tensor.numel())
@@ -85,7 +88,7 @@ class AsyncTensorSwapper(object):
         assert self.current_buffer_index != INVALID_BUFFER_INDEX
 
         swap_buffer = self._get_current_buffer()
-        swap_buffer.insert_tensor(tensor, swap_path, aligned_numel)
+        swap_buffer.insert_tensor(tensor, swap_path, aligned_numel, swap_offset)
 
     def _make_swap_space(self, numel):
         if self.current_buffer_index == INVALID_BUFFER_INDEX:
@@ -130,8 +133,8 @@ class AsyncTensorSwapper(object):
             buffer = self._get_buffer(buffer_index)
             swap_tensors = buffer.get_swap_tensors()
             swap_paths = buffer.get_swap_paths()
-            self.num_pending_swaps += len(swap_tensors)
-            swap_out_tensors(self.aio_handle, swap_tensors, swap_paths)
+            swap_offsets = buffer.get_swap_offsets()
+            self.num_pending_swaps += swap_out_tensors(self.aio_handle, swap_tensors, swap_paths, swap_offsets)
 
         self.swapping_buffer_index += self.ready_buffer_index
         self.ready_buffer_index = []

@@ -345,9 +345,9 @@ class AsyncPartitionedParameterSwapper(object):
         swap_out_params = self._get_swap_buffers(params)
         self._track_numel(params)
 
-        swap_out_tensors(self.aio_write_handle, swap_out_params, swap_out_paths)
+        num_swap_ops = swap_out_tensors(self.aio_write_handle, swap_out_params, swap_out_paths)
 
-        self.pending_writes += len(swap_out_params)
+        self.pending_writes += num_swap_ops
         self.swap_out_params += params
 
         if not async_op:
@@ -360,7 +360,7 @@ class AsyncPartitionedParameterSwapper(object):
         self._swap_out(params, async_op=async_op)
 
     # book keeping function for inflight swap in
-    def _update_inflight_swap_in(self, params, swap_in_buffers, inflight_numel):
+    def _update_inflight_swap_in(self, params, swap_in_buffers, inflight_numel, num_swap_ops=None):
         self.inflight_params.extend(params)
         self.inflight_swap_in_buffers.extend(swap_in_buffers)
         self.inflight_numel += inflight_numel
@@ -368,7 +368,7 @@ class AsyncPartitionedParameterSwapper(object):
         for param in params:
             param.ds_tensor.status = PartitionedParamStatus.INFLIGHT
 
-        self.pending_reads += len(params)
+        self.pending_reads += num_swap_ops if num_swap_ops is not None else len(params)
 
     #assigns an in memory buffer and swaps in from nvme
     def swap_in(self, params, async_op=True, swap_in_buffers=None):
@@ -403,9 +403,9 @@ class AsyncPartitionedParameterSwapper(object):
         else:
             inflight_numel = sum([t.numel() for t in swap_in_buffers])
 
-        swap_in_tensors(self.aio_read_handle, swap_in_buffers, swap_in_paths)
+        num_swap_ops = swap_in_tensors(self.aio_read_handle, swap_in_buffers, swap_in_paths)
 
-        self._update_inflight_swap_in(params, swap_in_buffers, inflight_numel)
+        self._update_inflight_swap_in(params, swap_in_buffers, inflight_numel, num_swap_ops)
 
         if not async_op:
             self.synchronize_reads()
@@ -427,8 +427,8 @@ class AsyncPartitionedParameterSwapper(object):
 
         swap_in_paths = self._get_swap_paths([param])
 
-        swap_in_tensors(self.aio_read_handle, swap_in_buffers, swap_in_paths)
-        self._update_inflight_swap_in([param], swap_in_buffers, inflight_numel)
+        num_swap_ops = swap_in_tensors(self.aio_read_handle, swap_in_buffers, swap_in_paths)
+        self._update_inflight_swap_in([param], swap_in_buffers, inflight_numel, num_swap_ops)
         self.synchronize_reads()
 
         if require_swap_buffer:

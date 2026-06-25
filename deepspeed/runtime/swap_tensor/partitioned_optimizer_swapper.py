@@ -109,20 +109,21 @@ class PartitionedOptimizerSwapper(OptimizerSwapper):
             raise
 
     def _swap_out_optimizer_state(self, swap_info):
-        pinned_tensors, pinned_paths = swap_info.get_swap_buffers_and_paths(True)
+        pinned_tensors, pinned_paths, pinned_offsets = swap_info.get_swap_buffers_and_paths(True)
         WRITE_TIMER = 'swap_submit_write'
         self._start_timer(WRITE_TIMER)
 
-        swap_out_tensors(self.aio_handle, pinned_tensors, pinned_paths)
-        assert self.aio_handle.wait() == len(pinned_tensors)
+        num_swap_ops = swap_out_tensors(self.aio_handle, pinned_tensors, pinned_paths, pinned_offsets)
+        assert self.aio_handle.wait() == num_swap_ops
 
-        unpinned_tensors, unpinned_paths = swap_info.get_swap_buffers_and_paths(False)
+        unpinned_tensors, unpinned_paths, unpinned_offsets = swap_info.get_swap_buffers_and_paths(False)
         if len(unpinned_tensors) > 0:
             staging_lease = self._allocate_staging_lease(owner='partitioned optimizer swap-out staging')
             try:
                 self._swap_out_unpinned_tensors(aio_handle=self.aio_handle,
                                                 unpinned_tensors=unpinned_tensors,
                                                 dest_paths=unpinned_paths,
+                                                dest_offsets=unpinned_offsets,
                                                 pinned_buffers=staging_lease.buffers)
             finally:
                 staging_lease.release()
@@ -143,8 +144,9 @@ class PartitionedOptimizerSwapper(OptimizerSwapper):
             param_gradients = swap_info.swapped_gradients.values()
             swap_buffers = [parameter.grad.narrow(0, grad.offset, grad.length) for grad in param_gradients]
             swap_paths = [grad.path for grad in param_gradients]
-            swap_out_tensors(self.aio_handle, swap_buffers, swap_paths)
-            assert len(swap_buffers) == self.aio_handle.wait()
+            swap_offsets = [grad.file_offset for grad in param_gradients]
+            num_swap_ops = swap_out_tensors(self.aio_handle, swap_buffers, swap_paths, swap_offsets)
+            assert num_swap_ops == self.aio_handle.wait()
             if swap_info.unswapped_gradients:
                 swap_info.write_unswapped_gradients(src_buffer=parameter.grad)
 
@@ -192,13 +194,14 @@ class PartitionedOptimizerSwapper(OptimizerSwapper):
         WAIT_TIMER = 'swap_wait_read_param'
 
         self._start_timer(READ_TIMER)
-        swap_in_tensors(aio_handle, swap_buffers, swap_info.get_swap_paths())
+        num_swap_ops = swap_in_tensors(aio_handle, swap_buffers, swap_info.get_swap_paths(),
+                                       swap_info.get_swap_offsets())
         self._stop_timer(READ_TIMER)
 
         swap_bytes = sum([buffer.numel() * buffer.element_size() for buffer in swap_buffers])
 
         self._start_timer(WAIT_TIMER)
-        aio_handle.wait()
+        assert num_swap_ops == aio_handle.wait()
         self._stop_timer(WAIT_TIMER)
 
         swap_info.set_swap_buffers(dest_buffers, self._io_aligned_numel(swap_info.numel()))
@@ -212,14 +215,15 @@ class PartitionedOptimizerSwapper(OptimizerSwapper):
         param_gradients = swap_info.swapped_gradients.values()
         swap_buffers = [gradient_tensor.narrow(0, grad.offset, grad.length) for grad in param_gradients]
         swap_paths = [grad.path for grad in param_gradients]
+        swap_offsets = [grad.file_offset for grad in param_gradients]
         SWAP_READ_GRADIENTS = 'swap_submit_read_gradient'
         SWAP_WAIT_GRADIENTS = 'swap_submit_wait_gradient'
         self._start_timer(SWAP_READ_GRADIENTS)
-        swap_in_tensors(aio_handle, swap_buffers, swap_paths)
+        num_swap_ops = swap_in_tensors(aio_handle, swap_buffers, swap_paths, swap_offsets)
         self._stop_timer(SWAP_READ_GRADIENTS)
 
         self._start_timer(SWAP_WAIT_GRADIENTS)
-        assert len(swap_buffers) == aio_handle.wait()
+        assert num_swap_ops == aio_handle.wait()
         self._stop_timer(SWAP_WAIT_GRADIENTS)
 
         self._log_timers([SWAP_READ_GRADIENTS, SWAP_WAIT_GRADIENTS])

@@ -29,11 +29,13 @@ from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
 import deepspeed.runtime.zenflow.engine_stage3 as zf_engine_stage3
 from deepspeed.runtime.zero.utils import get_mapping_to_flat_buffer
 from deepspeed.runtime.zero.offload_states import offload_adam_states, reload_adam_states
-from deepspeed.ops.adam import DeepSpeedCPUAdam
+from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 from deepspeed.runtime.swap_tensor.partitioned_param_swapper import PartitionedParamStatus
 from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerSwapper
 from deepspeed.runtime.swap_tensor.partitioned_optimizer_swapper import PartitionedOptimizerSwapper
-from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedOptimizerSwapper
+from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import PipelinedOptimizerSwapper, \
+    SuperRLPipelinedGDSOptimizerSwapper
+from deepspeed.runtime.swap_tensor.superrl_io import ensure_superrl_io_gds_ready, make_superrl_io_swap_config
 from deepspeed.checkpoint.constants import OPTIMIZER_STATE_DICT, FP32_FLAT_GROUPS, PARTITION_COUNT, ZERO_STAGE, LOSS_SCALER
 from deepspeed.accelerator import get_accelerator
 
@@ -176,6 +178,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         gradient_accumulation_steps=1,
         elastic_checkpoint=False,
         aio_config=None,
+        superrl_io_config=None,
         all2all_process_group=None,
         zero_hpz_partition_size=1,
         zero_quantized_weights=False,
@@ -308,6 +311,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.inf_or_nan_tracker: Tensor = torch.zeros(1, dtype=torch.bool, device=self.device, requires_grad=False)
 
         self.deepspeed_adam_offload = (self.offload_optimizer and type(init_optimizer) == DeepSpeedCPUAdam)
+        self.superrl_io_config = superrl_io_config
+        self.superrl_io_enabled = getattr(superrl_io_config, "enabled", False)
+        self.superrl_io_optimizer = self._configure_superrl_io_optimizer() if self.superrl_io_enabled else None
 
         ### streams used for overlapping computation with communication
         self.reduce_and_partition_stream = None if get_accelerator().is_synchronized_device() else get_accelerator(
@@ -695,18 +701,64 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 f"FP16 params swapping is {self.params_in_nvme_and_cpu}, Max params in CPU is {self.max_params_in_cpu}",
                 force=False)
 
+    def _configure_superrl_io_optimizer(self):
+        if not self.offload_optimizer or not self.swap_optimizer:
+            raise ValueError("SuperRL-IO requires ZeRO-3 NVMe optimizer offload.")
+        if type(self.optimizer) != DeepSpeedCPUAdam:
+            raise ValueError("SuperRL-IO currently expects the base ZeRO-3 offload optimizer to be DeepSpeedCPUAdam.")
+
+        group = self.optimizer.param_groups[0]
+        dummy_param = torch.nn.Parameter(torch.empty(1,
+                                                     device=get_accelerator().current_device_name(),
+                                                     dtype=self.master_weights_and_grads_dtype))
+        optimizer = FusedAdam([dummy_param],
+                              lr=group["lr"],
+                              bias_correction=group.get("bias_correction", True),
+                              betas=group["betas"],
+                              eps=group["eps"],
+                              adam_w_mode=getattr(self.optimizer, "adam_w_mode", True),
+                              weight_decay=group["weight_decay"],
+                              amsgrad=group.get("amsgrad", False))
+        optimizer.param_groups[0]["params"] = []
+
+        for group in self.optimizer.param_groups[1:]:
+            optimizer.add_param_group({
+                "params": [],
+                "lr": group["lr"],
+                "bias_correction": group.get("bias_correction", True),
+                "betas": group["betas"],
+                "eps": group["eps"],
+                "weight_decay": group["weight_decay"],
+                "amsgrad": group.get("amsgrad", False),
+            })
+
+        if dist.get_rank() == 0:
+            logger.info("SuperRL-IO: configured internal GPU FusedAdam for NVMe-resident optimizer states")
+
+        return optimizer
+
     def _configure_tensor_swapping(self, offload_optimizer_config, aio_config):
         nvme_swap_folder = os.path.join(offload_optimizer_config.nvme_path, 'zero_stage_3')
         os.makedirs(nvme_swap_folder, exist_ok=True)
         if dist.get_rank() == 0:
             logger.info('Tensor Swapping: Adding optimizer tensors')
 
-        swapper_type = PipelinedOptimizerSwapper if offload_optimizer_config.pipeline else PartitionedOptimizerSwapper
+        ensure_superrl_io_gds_ready(self.superrl_io_config, offload_optimizer_config, aio_config)
 
-        self.optimizer_swapper = swapper_type(swap_config=offload_optimizer_config,
+        swapper_optimizer = self.optimizer
+        swap_config = offload_optimizer_config
+        if self.superrl_io_enabled:
+            swapper_type = SuperRLPipelinedGDSOptimizerSwapper
+            swap_config = make_superrl_io_swap_config(offload_optimizer_config)
+            swapper_optimizer = self.superrl_io_optimizer
+        else:
+            swapper_type = PipelinedOptimizerSwapper if offload_optimizer_config.pipeline \
+                else PartitionedOptimizerSwapper
+
+        self.optimizer_swapper = swapper_type(swap_config=swap_config,
                                               aio_config=aio_config,
                                               base_folder=nvme_swap_folder,
-                                              optimizer=self.optimizer,
+                                              optimizer=swapper_optimizer,
                                               largest_numel=max(self.fp16_partitioned_groups_flat_numel),
                                               device=self.device,
                                               dtype=self.master_weights_and_grads_dtype,
@@ -1063,7 +1115,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 else:
                     self.zenflow_cpu_optimizer_step()
 
-        if self.offload_optimizer:
+        if self.superrl_io_enabled and self._swappable_optimizer_subgroup(sub_group_id):
+            self.superrl_io_optimizer.param_groups[param_group_id]['params'] = [fp32_param]
+            step_with_gradscaler(self.superrl_io_optimizer)
+            self.superrl_io_optimizer.param_groups[param_group_id]['params'] = []
+        elif self.offload_optimizer:
             cur_device = self.subgroup_to_device[sub_group_id]
             if cur_device == 'cpu':
                 self.optimizer.param_groups[param_group_id]['params'] = [fp32_param]

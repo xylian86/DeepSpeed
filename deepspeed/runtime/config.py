@@ -506,6 +506,24 @@ def get_superrl_cache_config(param_dict):
     raise ValueError("DeepSpeedConfig: superrl_cache must be a boolean or an object with an enabled field")
 
 
+class DeepSpeedSuperRLIOConfig:
+
+    def __init__(self, enabled=False):
+        self.enabled = enabled
+
+    def __repr__(self):
+        return f"DeepSpeedSuperRLIOConfig(enabled={self.enabled})"
+
+
+def get_superrl_io_config(param_dict):
+    value = param_dict.get("superrl_io", False)
+    if isinstance(value, bool):
+        return DeepSpeedSuperRLIOConfig(enabled=value)
+    if isinstance(value, dict):
+        return DeepSpeedSuperRLIOConfig(enabled=bool(value.get("enabled", False)))
+    raise ValueError("DeepSpeedConfig: superrl_io must be a boolean or an object with an enabled field")
+
+
 class HybridEngineConfig(DeepSpeedConfigModel):
     enabled: bool = False
     max_out_tokens: int = 512
@@ -875,6 +893,7 @@ class DeepSpeedConfig(object):
 
         self.aio_config = get_aio_config(param_dict)
         self.superrl_cache_config = get_superrl_cache_config(param_dict)
+        self.superrl_io_config = get_superrl_io_config(param_dict)
 
         self.dataloader_drop_last = get_dataloader_drop_last(param_dict)
 

@@ -231,8 +231,7 @@ class LookaheadDRAMCache:
                                 next_use_index=candidate_next_use,
                                 status="inflight")
             self.entries[param.ds_id] = entry
-            swap_in_tensors(self.aio_handle, [entry.buffer], [entry.path])
-            self.pending_reads += 1
+            self.pending_reads += swap_in_tensors(self.aio_handle, [entry.buffer], [entry.path])
             self.prefetches += 1
             self.bytes_read += entry.nbytes
             submitted += 1

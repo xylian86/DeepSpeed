@@ -1141,6 +1141,9 @@ class DeepSpeedEngine(Module):
     def aio_config(self):
         return self._config.aio_config
 
+    def superrl_io_config(self):
+        return self._config.superrl_io_config
+
     def zenflow_config(self):
         return self._config.zero_config.zenflow
 
@@ -1927,6 +1930,7 @@ class DeepSpeedEngine(Module):
                     gradient_predivide_factor=self.gradient_predivide_factor(),
                     gradient_accumulation_steps=self.gradient_accumulation_steps(),
                     aio_config=self.aio_config(),
+                    superrl_io_config=self.superrl_io_config(),
                     gradient_accumulation_dtype=gradient_accumulation_dtype,
                     communication_data_type=self.communication_data_type,
                     fp16_master_weights_and_gradients=self.fp16_master_weights_and_gradients(),

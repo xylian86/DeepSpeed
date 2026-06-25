@@ -11,7 +11,8 @@ import torch
 from deepspeed.runtime.swap_tensor import utils as swap_utils
 from deepspeed.runtime.swap_tensor import optimizer_utils as optimizer_swap_utils
 from deepspeed.runtime.swap_tensor.lookahead_dram_cache import LookaheadDRAMCache
-from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerSwapper, split_swap_buffer_counts
+from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerStateSwapInfo, OptimizerSwapFileAllocator, \
+    OptimizerSwapper, split_swap_buffer_counts
 from deepspeed.runtime.swap_tensor.partitioned_param_swapper import AsyncPartitionedParameterSwapper, \
     PartitionedParamStatus
 from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import ASYNC_SWAP_IN, ASYNC_SWAP_OUT, SYNC_SWAP_IN, \
@@ -22,6 +23,9 @@ class _FakeAccelerator:
 
     def pin_memory(self, tensor, align_bytes=0):
         return tensor
+
+    def is_pinned(self, tensor):
+        return True
 
 
 class _FakeAIOHandle:
@@ -173,6 +177,44 @@ def test_swap_buffer_manager_lazy_slots_allocate_on_demand(monkeypatch):
     manager.free(reused_buffers)
 
 
+def test_swap_buffer_manager_supports_custom_pin_hooks(monkeypatch):
+    _patch_swap_buffer_manager_deps(monkeypatch)
+
+    pinned = []
+    unpinned = []
+
+    def pin_fn(buffer):
+        pinned.append(buffer)
+        return buffer
+
+    def unpin_fn(buffer):
+        unpinned.append(buffer)
+
+    manager = swap_utils.SwapBufferManager(num_elems=8,
+                                           count=1,
+                                           dtype=torch.float32,
+                                           pin_memory_fn=pin_fn,
+                                           unpin_memory_fn=unpin_fn)
+
+    assert len(pinned) == 1
+    buffers = manager.allocate(num_elems=4, count=1, dtype=torch.float32)
+    assert buffers is not None
+    manager.free(buffers)
+
+    buffers = manager.allocate(num_elems=8, count=1, dtype=torch.float32)
+    assert buffers is not None
+    manager.free(buffers)
+
+    assert len(pinned) == 1
+    assert len(unpinned) == 0
+
+    buffers = manager.allocate(num_elems=8, count=1, dtype=torch.float32)
+    manager.free(buffers)
+    manager._ensure_slot_capacity(index=0, num_elems=16)
+    assert len(pinned) == 2
+    assert len(unpinned) == 1
+
+
 def test_swap_buffer_manager_summary_reports_lifecycle_counters(monkeypatch):
     _patch_swap_buffer_manager_deps(monkeypatch)
 
@@ -210,6 +252,92 @@ def test_swap_buffer_lease_releases_once(monkeypatch):
 
     with pytest.raises(RuntimeError, match="released more than once"):
         lease.release()
+
+
+def test_swap_in_tensors_forwards_file_offsets():
+    aio_handle = _FakeAIOHandle()
+    buffers = [torch.empty(2, dtype=torch.float32), torch.empty(3, dtype=torch.float32)]
+
+    swap_utils.swap_in_tensors(aio_handle, buffers, ["container.swp", "container.swp"], [128, 256])
+
+    assert [read[1:] for read in aio_handle.reads] == [("container.swp", 128), ("container.swp", 256)]
+
+
+def test_swap_out_tensors_coalesces_adjacent_container_writes():
+    aio_handle = _FakeAIOHandle()
+    base = torch.arange(8, dtype=torch.float32)
+    buffers = [base.narrow(0, 0, 2), base.narrow(0, 2, 3), base.narrow(0, 5, 1)]
+
+    num_ops = swap_utils.swap_out_tensors(aio_handle, buffers, ["container.swp"] * 3, [128, 136, 148])
+
+    assert num_ops == 1
+    assert len(aio_handle.writes) == 1
+    assert aio_handle.writes[0][1:] == ("container.swp", 128)
+    assert torch.equal(aio_handle.writes[0][0], base[:6])
+
+
+def test_swap_in_tensors_coalesces_adjacent_container_reads():
+    aio_handle = _FakeAIOHandle()
+    base = torch.empty(8, dtype=torch.float32)
+    buffers = [base.narrow(0, 0, 2), base.narrow(0, 2, 3)]
+
+    num_ops = swap_utils.swap_in_tensors(aio_handle, buffers, ["container.swp"] * 2, [128, 136])
+
+    assert num_ops == 1
+    assert len(aio_handle.reads) == 1
+    assert aio_handle.reads[0][1:] == ("container.swp", 128)
+    assert aio_handle.reads[0][0].data_ptr() == base.data_ptr()
+    assert aio_handle.reads[0][0].numel() == 5
+
+
+def test_swap_tensors_do_not_coalesce_non_adjacent_offsets_or_paths():
+    base = torch.arange(8, dtype=torch.float32)
+    buffers = [base.narrow(0, 0, 2), base.narrow(0, 2, 3)]
+
+    offset_gap_handle = _FakeAIOHandle()
+    offset_gap_ops = swap_utils.swap_out_tensors(offset_gap_handle, buffers, ["container.swp"] * 2, [128, 256])
+    assert offset_gap_ops == 2
+    assert [write[1:] for write in offset_gap_handle.writes] == [("container.swp", 128), ("container.swp", 256)]
+
+    path_gap_handle = _FakeAIOHandle()
+    path_gap_ops = swap_utils.swap_out_tensors(path_gap_handle, buffers, ["a.swp", "b.swp"], [128, 136])
+    assert path_gap_ops == 2
+    assert [write[1:] for write in path_gap_handle.writes] == [("a.swp", 128), ("b.swp", 136)]
+
+
+def test_swap_buffer_pool_waits_on_coalesced_request_count(monkeypatch):
+    _patch_swap_buffer_manager_deps(monkeypatch)
+
+    pool = swap_utils.SwapBufferPool([torch.empty(8, dtype=torch.float32)])
+    first_swap_tensor, _ = pool.insert_tensor(torch.arange(2, dtype=torch.float32), "container.swp", 2, 128)
+    second_swap_tensor, _ = pool.insert_tensor(torch.arange(3, dtype=torch.float32), "container.swp", 3, 136)
+    aio_handle = _FakeAIOHandle()
+
+    assert first_swap_tensor is not None
+    assert second_swap_tensor is not None
+    assert pool.swap_out(aio_handle) == 1
+    assert aio_handle.wait_counts == [1]
+
+
+def test_optimizer_swap_info_allocates_container_offsets():
+    allocator = OptimizerSwapFileAllocator(path="optimizer_state_and_gradient.swp",
+                                           element_size=torch.tensor([], dtype=torch.float32).element_size(),
+                                           numel_alignment=8)
+    param = torch.empty(10, dtype=torch.float32)
+    param.ds_id = "param0"
+    state = torch.empty(10, dtype=torch.float32)
+    state.ds_id = "state0"
+
+    swap_info = OptimizerStateSwapInfo(parameter=param, numel=10, base_folder="unused", swap_allocator=allocator)
+    swap_info.add_state_tensors([state])
+
+    assert swap_info.get_swap_paths() == ["optimizer_state_and_gradient.swp"] * 2
+    assert swap_info.get_swap_offsets() == [0, 64]
+
+    gradient_paths, gradient_offsets = swap_info.get_or_create_gradient_paths_and_offsets(offsets=[0, 8],
+                                                                                          lengths=[3, 9])
+    assert gradient_paths == ["optimizer_state_and_gradient.swp"] * 2
+    assert gradient_offsets == [128, 160]
 
 
 def test_lookahead_dram_cache_prefetches_nearest_future_uses(monkeypatch):
