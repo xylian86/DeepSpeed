@@ -95,8 +95,10 @@ def test_zero_offload_optimizer_config_nvme_pipeline_buffer_count_validation():
         "device": "nvme",
         "pipeline_read": True,
         "buffer_count": 12,
+        "buffer_size": 12345,
     })
     assert config.pipeline == True
+    assert config.buffer_size == 12345
 
     config = DeepSpeedZeroOffloadOptimizerConfig(**{
         "device": "nvme",
@@ -112,3 +114,11 @@ def test_zero_offload_optimizer_config_nvme_pipeline_buffer_count_validation():
         "buffer_count": 16,
     })
     assert config.pipeline == True
+
+    with pytest.raises(ValidationError, match="requires buffer_size > 0"):
+        DeepSpeedZeroOffloadOptimizerConfig(**{
+            "device": "nvme",
+            "pipeline_read": True,
+            "buffer_count": 12,
+            "buffer_size": 0,
+        })

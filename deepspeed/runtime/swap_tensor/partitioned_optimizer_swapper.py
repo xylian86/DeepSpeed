@@ -118,25 +118,14 @@ class PartitionedOptimizerSwapper(OptimizerSwapper):
 
         unpinned_tensors, unpinned_paths = swap_info.get_swap_buffers_and_paths(False)
         if len(unpinned_tensors) > 0:
-            staging_lease = self.staging_swap_buffer_manager.allocate_all_lease(
-                num_elems=self.largest_numel,
-                dtype=self.dtype,
-                owner='partitioned optimizer swap-out staging')
-            if staging_lease is None:
-                raise RuntimeError(
-                    self.staging_swap_buffer_manager.allocation_failure_message(
-                        requested_num_elems=self.largest_numel,
-                        requested_count=self.staging_swap_buffer_manager.count,
-                        owner='partitioned optimizer swap-out staging'))
+            staging_lease = self._allocate_staging_lease(owner='partitioned optimizer swap-out staging')
             try:
                 self._swap_out_unpinned_tensors(aio_handle=self.aio_handle,
                                                 unpinned_tensors=unpinned_tensors,
                                                 dest_paths=unpinned_paths,
                                                 pinned_buffers=staging_lease.buffers)
-            except Exception:
+            finally:
                 staging_lease.release()
-                raise
-            self._append_swap_info_lease(swap_info, staging_lease)
 
         self._stop_timer(WRITE_TIMER)
         self._log_timers([WRITE_TIMER])

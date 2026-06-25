@@ -6,6 +6,8 @@
 Functionality of swapping tensors to/from (NVMe) storage devices.
 """
 
+import time
+
 import torch
 from deepspeed.utils.logging import logger
 from deepspeed.accelerator import get_accelerator
@@ -22,9 +24,13 @@ def swap_in_tensors(swap_handle, tensor_buffers, swap_paths):
         assert (swap_handle.async_pread(buffer, path, 0) == 0)
 
 
-def swap_out_tensors(swap_handle, tensor_buffers, swap_paths):
-    for buffer, path in zip(tensor_buffers, swap_paths):
-        assert (swap_handle.async_pwrite(buffer, path, 0) == 0)
+def swap_out_tensors(swap_handle, tensor_buffers, swap_paths, swap_offsets=None):
+    if swap_offsets is None:
+        swap_offsets = [0] * len(tensor_buffers)
+    assert len(tensor_buffers) == len(swap_paths)
+    assert len(tensor_buffers) == len(swap_offsets)
+    for buffer, path, offset in zip(tensor_buffers, swap_paths, swap_offsets):
+        assert (swap_handle.async_pwrite(buffer, path, offset) == 0)
 
 
 def print_object(obj, name, exclude_list=[]):
@@ -33,6 +39,11 @@ def print_object(obj, name, exclude_list=[]):
         if arg not in exclude_list:
             dots = '.' * (29 - len(arg))
             logger.info('  {} {} {}'.format(arg, dots, getattr(obj, arg)))
+
+
+def print_rank_0(message, debug=False, force=False):
+    if dist.get_rank() == 0 and (debug or force):
+        print(message)
 
 
 class SwapBuffer(object):
@@ -210,12 +221,15 @@ class SwapBufferManager(object):
         self.count = count
         self.dtype = dtype
         self.element_size = torch.tensor([], dtype=dtype).element_size()
+        start_time = time.time()
         self.all_buffers = [
             get_accelerator().pin_memory(torch.empty(num_elems, device='cpu', dtype=dtype), align_bytes=0)
             for _ in range(count)
         ]
+        self.pin_memory_time_sec = time.time() - start_time
         self.free_buffer_index = [i for i in range(count)]
         self.used_buffer_index = {}
+        self.buffer_bytes = self.element_size * num_elems
         self.total_bytes = self.element_size * num_elems * count
         self.gigabytes = self.total_bytes / (1024**3)
         self.num_allocations = 0
@@ -223,16 +237,26 @@ class SwapBufferManager(object):
         self.max_allocated_buffers = 0
         self.max_requested_num_elems = 0
         self.max_requested_count = 0
+        self.max_requested_bytes = 0
 
         if dist.get_rank() == 0:
             exclude_list = ['all_buffers']
             print_object(obj=self, name='SwapBufferManager', exclude_list=exclude_list)
+            summary = (
+                f"SwapBufferManager[{self.name}] pinned {count} buffer(s), "
+                f"buffer_num_elems={self.num_elems}, "
+                f"buffer_size={self.buffer_bytes / (1024**3):.2f} GiB, "
+                f"pool_size={self.total_bytes / (1024**3):.2f} GiB, "
+                f"pin_memory_time={self.pin_memory_time_sec:.3f} sec")
+            logger.info(summary)
+            print_rank_0(summary, force=True)
 
     def allocate(self, num_elems, count, dtype):
         assert dtype == self.dtype
         assert num_elems <= self.num_elems
         self.max_requested_num_elems = max(self.max_requested_num_elems, num_elems)
         self.max_requested_count = max(self.max_requested_count, count)
+        self.max_requested_bytes = max(self.max_requested_bytes, num_elems * count * self.element_size)
         if count <= 0 or count > len(self.free_buffer_index):
             self.num_failed_allocations += 1
             return None
@@ -283,12 +307,18 @@ class SwapBufferManager(object):
             'free_buffer_count': len(self.free_buffer_index),
             'used_buffer_count': len(self.used_buffer_index),
             'element_size': self.element_size,
+            'buffer_bytes': self.buffer_bytes,
             'total_bytes': self.total_bytes,
+            'used_bytes': len(self.used_buffer_index) * self.buffer_bytes,
+            'free_bytes': len(self.free_buffer_index) * self.buffer_bytes,
+            'pin_memory_time_sec': self.pin_memory_time_sec,
             'num_allocations': self.num_allocations,
             'num_failed_allocations': self.num_failed_allocations,
             'max_allocated_buffers': self.max_allocated_buffers,
+            'max_allocated_bytes': self.max_allocated_buffers * self.buffer_bytes,
             'max_requested_num_elems': self.max_requested_num_elems,
             'max_requested_count': self.max_requested_count,
+            'max_requested_bytes': self.max_requested_bytes,
         }
 
     def allocation_failure_message(self, requested_num_elems, requested_count, owner):

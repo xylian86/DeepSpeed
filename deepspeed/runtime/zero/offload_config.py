@@ -72,6 +72,13 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
     gradient, momentum, and variance).
     """
 
+    buffer_size: int = Field(pp_int(1e8), ge=0)
+    """
+    Number of elements per staging buffer for optimizer state offloading to NVMe.
+    Pipeline mode uses this as the chunk size for temporary pinned write staging
+    buffers.
+    """
+
     pin_memory: bool = False
     """
     Offload to page-locked CPU memory. This could boost throughput at the cost
@@ -117,6 +124,8 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
                     "next async swap-in buffers, previous async swap-out buffers, and "
                     "write staging buffers. Increase buffer_count or disable optimizer "
                     "offload pipelining.")
+            if self.buffer_size <= 0:
+                raise ValueError("NVMe optimizer offload pipelining requires buffer_size > 0.")
         return self
 
     def _minimum_pipeline_buffer_count(self) -> int:

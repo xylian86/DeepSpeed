@@ -199,13 +199,17 @@ class OptimizerSwapper(object):
         self.largest_numel = self._io_aligned_numel(largest_numel)
         self.dtype = dtype
         state_buffer_count, staging_buffer_count = split_swap_buffer_counts(swap_config)
+        self.staging_num_write_calls = 0
+        self.staging_num_chunks_written = 0
+        self.staging_num_elements_written = 0
         self.swap_buffer_manager = SwapBufferManager(num_elems=self.largest_numel,
                                                      count=state_buffer_count,
                                                      dtype=dtype,
                                                      name='optimizer_state')
         self.staging_swap_buffer_manager = self.swap_buffer_manager
         if staging_buffer_count > 0:
-            self.staging_swap_buffer_manager = SwapBufferManager(num_elems=self.largest_numel,
+            staging_buffer_numel = self._staging_buffer_numel(swap_config)
+            self.staging_swap_buffer_manager = SwapBufferManager(num_elems=staging_buffer_numel,
                                                                  count=staging_buffer_count,
                                                                  dtype=dtype,
                                                                  name='optimizer_staging')
@@ -243,6 +247,38 @@ class OptimizerSwapper(object):
         elif swap_info.swap_buffers:
             self.swap_buffer_manager.free(swap_info.swap_buffers)
         swap_info.swap_buffers = []
+
+    def _staging_buffer_numel(self, swap_config):
+        configured_numel = max(1, int(getattr(swap_config, 'buffer_size', self.largest_numel)))
+        min_aio_numel = max(1, self.min_aio_bytes // self.swap_element_size)
+        configured_numel = max(configured_numel, min_aio_numel)
+        return min(self.largest_numel, self._io_aligned_numel(configured_numel))
+
+    def _allocate_staging_lease(self, owner):
+        manager = self.staging_swap_buffer_manager
+        lease = manager.allocate_all_lease(num_elems=manager.num_elems, dtype=self.dtype, owner=owner)
+        if lease is None:
+            raise RuntimeError(
+                manager.allocation_failure_message(requested_num_elems=manager.num_elems,
+                                                   requested_count=manager.count,
+                                                   owner=owner))
+        return lease
+
+    def _split_tensors_for_staging_chunks(self, tensors, offsets):
+        chunk_numel = self.staging_swap_buffer_manager.num_elems
+        chunked_tensors = []
+        chunked_offsets = []
+
+        for tensor, offset in zip(tensors, offsets):
+            tensor_numel = tensor.numel()
+            tensor_offset = 0
+            while tensor_offset < tensor_numel:
+                chunk_numel_for_tensor = min(chunk_numel, tensor_numel - tensor_offset)
+                chunked_tensors.append(tensor.narrow(0, tensor_offset, chunk_numel_for_tensor))
+                chunked_offsets.append(offset + tensor_offset)
+                tensor_offset += chunk_numel_for_tensor
+
+        return chunked_tensors, chunked_offsets
 
     def purge_state(self):
         for swap_info in self.swap_params_info.values():
@@ -306,15 +342,7 @@ class OptimizerSwapper(object):
 
         if len(swappable_tensors) > 0:
             if not gradient_swapper.has_buffers():
-                lease = self.staging_swap_buffer_manager.allocate_all_lease(num_elems=self.largest_numel,
-                                                                            dtype=self.dtype,
-                                                                            owner='gradient swap-out staging')
-                if lease is None:
-                    raise RuntimeError(
-                        self.staging_swap_buffer_manager.allocation_failure_message(
-                            requested_num_elems=self.largest_numel,
-                            requested_count=self.staging_swap_buffer_manager.count,
-                            owner='gradient swap-out staging'))
+                lease = self._allocate_staging_lease(owner='gradient swap-out staging')
 
                 self.gradient_buffer_lease = lease
                 try:
@@ -324,6 +352,9 @@ class OptimizerSwapper(object):
                     lease.release()
                     raise
 
+            swappable_tensors, swappable_offsets = self._split_tensors_for_staging_chunks(swappable_tensors,
+                                                                                          swappable_offsets)
+            swappable_lengths = [tensor.numel() for tensor in swappable_tensors]
             swappable_paths = swap_info.get_or_create_gradient_paths(swappable_offsets, swappable_lengths)
 
             gradient_swapper.swap_out_tensors(tensor_list=swappable_tensors, path_list=swappable_paths)
@@ -339,16 +370,7 @@ class OptimizerSwapper(object):
 
         fp32_swap_paths = self._get_swap_paths(parameters=fp32_parameters, num_elems=fp16_num_elems)
 
-        fp32_pinned_lease = self.staging_swap_buffer_manager.allocate_all_lease(
-            num_elems=self.largest_numel,
-            dtype=self.dtype,
-            owner='initialize swapped fp16 params')
-        if fp32_pinned_lease is None:
-            raise RuntimeError(
-                self.staging_swap_buffer_manager.allocation_failure_message(
-                    requested_num_elems=self.largest_numel,
-                    requested_count=self.staging_swap_buffer_manager.count,
-                    owner='initialize swapped fp16 params'))
+        fp32_pinned_lease = self._allocate_staging_lease(owner='initialize swapped fp16 params')
         fp32_pinned_buffers = fp32_pinned_lease.buffers
 
         try:
@@ -356,7 +378,6 @@ class OptimizerSwapper(object):
             assert all([numel >= self.largest_numel for numel in fp16_buffer_numel]), \
             f"numel of fp16 buffers {fp16_buffer_numel} is too small for initializing fp32 params {self.largest_numel}"
 
-            fp32_swap_buffers = SwapBufferPool(fp32_pinned_buffers)
             fp16_swap_buffers = SwapBufferPool(fp16_pinned_buffers)
 
             curr_index = 0
@@ -373,15 +394,14 @@ class OptimizerSwapper(object):
                             f'swap_in_fp16_param: fp32_id = {OptimizerSwapper.parameter_id(fp32_parameters[true_index])} index = {true_index} orig_num_elem = {fp16_num_elems[true_index]}, swap_num_elem = {fp16_pinned_tensors[i].numel()}'
                         )
 
-                swap_out_count = self._swap_out_fp16_params(aio_handle=aio_handle,
-                                                            fp32_swap_paths=fp32_swap_paths[curr_index:],
-                                                            fp32_swap_buffers=fp32_swap_buffers,
-                                                            fp16_pinned_tensors=fp16_pinned_tensors)
+                swap_out_count = self._swap_out_unpinned_tensors(aio_handle=aio_handle,
+                                                                 unpinned_tensors=fp16_pinned_tensors,
+                                                                 dest_paths=fp32_swap_paths[curr_index:],
+                                                                 pinned_buffers=fp32_pinned_buffers)
                 assert swap_out_count == len(fp16_pinned_tensors), \
                 f"{swap_out_count} does not match {len(fp16_pinned_tensors)}"
 
                 fp16_swap_buffers.reset()
-                fp32_swap_buffers.reset()
                 curr_index += swap_out_count
 
         finally:
@@ -450,15 +470,7 @@ class OptimizerSwapper(object):
         SWAP_INIT_TIMER = "swap_init_write"
         self._start_timer(SWAP_INIT_TIMER)
 
-        pinned_lease = self.staging_swap_buffer_manager.allocate_all_lease(num_elems=self.largest_numel,
-                                                                           dtype=self.dtype,
-                                                                           owner='initialize optimizer params')
-        if pinned_lease is None:
-            raise RuntimeError(
-                self.staging_swap_buffer_manager.allocation_failure_message(
-                    requested_num_elems=self.largest_numel,
-                    requested_count=self.staging_swap_buffer_manager.count,
-                    owner='initialize optimizer params'))
+        pinned_lease = self._allocate_staging_lease(owner='initialize optimizer params')
         pinned_buffers = pinned_lease.buffers
 
         try:
@@ -491,27 +503,60 @@ class OptimizerSwapper(object):
         return swap_paths
 
     def _swap_out_unpinned_tensors(self, aio_handle, unpinned_tensors, dest_paths, pinned_buffers):
+        assert len(unpinned_tensors) <= len(dest_paths)
+        assert len(pinned_buffers) > 0
 
-        swap_buffer_count = len(pinned_buffers)
-        unpinned_tensor_count = len(unpinned_tensors)
+        pending_swap_count = 0
+        buffer_index = 0
+        chunks_written = 0
+        elements_written = 0
 
-        for i in range(0, unpinned_tensor_count, swap_buffer_count):
-            swap_tensor_count = min((unpinned_tensor_count - i), swap_buffer_count)
+        def wait_for_pending_writes():
+            nonlocal pending_swap_count, buffer_index
+            if pending_swap_count > 0:
+                assert aio_handle.wait() == pending_swap_count
+                pending_swap_count = 0
+                buffer_index = 0
 
-            src_tensors = unpinned_tensors[i:(i + swap_tensor_count)]
-            compute_lengths = [t.numel() for t in src_tensors]
-            compute_buffers = get_sized_buffers(pinned_buffers, compute_lengths)
+        for src_tensor, dest_path in zip(unpinned_tensors, dest_paths):
+            aligned_numel = self._io_aligned_numel(src_tensor.numel())
+            tensor_offset = 0
 
-            for dst, src in zip(compute_buffers, src_tensors):
-                dst.data.copy_(src.data)
+            while tensor_offset < aligned_numel:
+                if buffer_index == len(pinned_buffers):
+                    wait_for_pending_writes()
 
-            swap_lengths = [self._io_aligned_numel(t.numel()) for t in src_tensors]
-            swap_buffers = get_sized_buffers(pinned_buffers, swap_lengths)
+                staging_buffer = pinned_buffers[buffer_index]
+                chunk_numel = min(staging_buffer.numel(), aligned_numel - tensor_offset)
+                compute_numel = min(chunk_numel, max(0, src_tensor.numel() - tensor_offset))
 
-            swap_paths = dest_paths[i:(i + swap_tensor_count)]
-            swap_out_tensors(aio_handle, swap_buffers, swap_paths)
+                if compute_numel > 0:
+                    dst_tensor = staging_buffer.narrow(0, 0, compute_numel)
+                    src_slice = src_tensor.narrow(0, tensor_offset, compute_numel)
+                    dst_tensor.data.copy_(src_slice.data)
 
-            assert aio_handle.wait() == swap_tensor_count
+                swap_buffer = staging_buffer.narrow(0, 0, chunk_numel)
+                swap_offset = tensor_offset * self.swap_element_size
+                swap_out_tensors(aio_handle, [swap_buffer], [dest_path], [swap_offset])
+
+                pending_swap_count += 1
+                buffer_index += 1
+                chunks_written += 1
+                elements_written += chunk_numel
+                tensor_offset += chunk_numel
+
+        wait_for_pending_writes()
+        self.staging_num_write_calls += 1
+        self.staging_num_chunks_written += chunks_written
+        self.staging_num_elements_written += elements_written
+
+        if dist.get_rank() == 0:
+            logger.debug(
+                f"optimizer staging swap-out: tensors={len(unpinned_tensors)}, "
+                f"chunks={chunks_written}, "
+                f"bytes={(elements_written * self.swap_element_size) / (1024**3):.2f} GiB")
+
+        return len(unpinned_tensors)
 
     def _adjust_for_misaligned_lengths(self, tensors, offsets):
         new_tensors = []

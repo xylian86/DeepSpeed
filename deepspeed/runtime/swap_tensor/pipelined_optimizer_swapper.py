@@ -13,7 +13,6 @@ import torch
 from deepspeed.runtime.swap_tensor.constants import *
 from deepspeed.runtime.swap_tensor.utils import swap_in_tensors, swap_out_tensors, print_object
 from deepspeed.runtime.swap_tensor.async_swapper import AsyncTensorSwapper
-from deepspeed.runtime.swap_tensor.utils import get_sized_buffer
 from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerSwapper
 
 
@@ -178,7 +177,6 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
         assert swap_in_op.is_parameter(parameter)
 
         allocated_buffers = swap_in_op.allocated_buffers.copy()
-        swap_buffers = swap_in_op.state_buffers.copy()
         buffer_leases = swap_in_op.take_buffer_leases()
 
         try:
@@ -187,29 +185,17 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
             unpinned_tensors = param_info.get_unpinned_state_tensors()
 
             if len(unpinned_tensors) > 0:
-                aligned_numel = self._io_aligned_numel(param_info.numel())
-                staging_lease = self.staging_swap_buffer_manager.allocate_lease(
-                    num_elems=aligned_numel,
-                    count=len(unpinned_tensors),
-                    dtype=param_info.dtype(),
-                    owner='pipelined optimizer swap-out staging')
-                if staging_lease is None:
-                    raise RuntimeError(
-                        self.staging_swap_buffer_manager.allocation_failure_message(
-                            requested_num_elems=aligned_numel,
-                            requested_count=len(unpinned_tensors),
-                            owner='pipelined optimizer swap-out staging'))
-                new_alloc_buffers = staging_lease.buffers
+                _, unpinned_paths = param_info.get_swap_buffers_and_paths(False)
+                staging_lease = self._allocate_staging_lease(owner='pipelined optimizer swap-out staging')
+                try:
+                    self._swap_out_unpinned_tensors(aio_handle=aio_handle,
+                                                    unpinned_tensors=unpinned_tensors,
+                                                    dest_paths=unpinned_paths,
+                                                    pinned_buffers=staging_lease.buffers)
+                finally:
+                    staging_lease.release()
 
-                allocated_buffers += new_alloc_buffers
-                swap_buffers += new_alloc_buffers
-                buffer_leases.append(staging_lease)
-
-                for pinned_dst, unpinned_src in zip(new_alloc_buffers, unpinned_tensors):
-                    dst = get_sized_buffer(pinned_dst, unpinned_src.numel())
-                    dst.data.copy_(unpinned_src.data)
-
-            swap_paths = param_info.get_swap_paths()
+            swap_buffers, swap_paths = param_info.get_swap_buffers_and_paths(True)
             assert len(swap_paths) == len(swap_buffers)
 
             swap_out_tensors(aio_handle, swap_buffers, swap_paths)
