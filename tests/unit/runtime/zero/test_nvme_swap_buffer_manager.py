@@ -11,6 +11,8 @@ import torch
 from deepspeed.runtime.swap_tensor import utils as swap_utils
 from deepspeed.runtime.swap_tensor import optimizer_utils as optimizer_swap_utils
 from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerSwapper, split_swap_buffer_counts
+from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import ASYNC_SWAP_IN, ASYNC_SWAP_OUT, SYNC_SWAP_IN, \
+    SYNC_SWAP_OUT, OptimizerSwapOp, PipelinedOptimizerSwapper
 
 
 class _FakeAccelerator:
@@ -36,6 +38,15 @@ class _FakeAIOHandle:
         self.wait_counts.append(wait_count)
         self.pending_writes = 0
         return wait_count
+
+
+class _DummyLease:
+
+    def __init__(self, buffers):
+        self.buffers = buffers
+
+    def __len__(self):
+        return len(self.buffers)
 
 
 def _patch_swap_buffer_manager_deps(monkeypatch):
@@ -211,3 +222,50 @@ def test_optimizer_staging_swap_out_chunks_large_tensor(monkeypatch):
     assert swapper.staging_num_write_calls == 1
     assert swapper.staging_num_chunks_written == 3
     assert swapper.staging_num_elements_written == 10
+
+
+def test_pipelined_optimizer_swapper_reports_pipeline_occupancy(monkeypatch, capsys):
+    monkeypatch.setattr(swap_utils.dist, "get_rank", lambda: 0)
+
+    swapper = PipelinedOptimizerSwapper.__new__(PipelinedOptimizerSwapper)
+    swapper.pipeline_occupancy_events = 0
+    swapper.pipeline_occupancy_log_enabled = False
+    read_op = OptimizerSwapOp(aio_handle=None,
+                              read_op=True,
+                              param_info=SimpleNamespace(param_id="param0"),
+                              allocated_buffers=[torch.empty(1), torch.empty(1)],
+                              state_buffers=[torch.empty(1)],
+                              num_ops=2,
+                              buffer_leases=[_DummyLease([torch.empty(1), torch.empty(1)])])
+    write_op = OptimizerSwapOp(aio_handle=None,
+                               read_op=False,
+                               param_info=SimpleNamespace(param_id="param1"),
+                               allocated_buffers=[torch.empty(1)],
+                               state_buffers=[torch.empty(1)],
+                               num_ops=1,
+                               buffer_leases=[_DummyLease([torch.empty(1)])])
+    swapper.swap_ops = {
+        SYNC_SWAP_IN: read_op,
+        ASYNC_SWAP_IN: None,
+        SYNC_SWAP_OUT: None,
+        ASYNC_SWAP_OUT: write_op,
+    }
+
+    occupancy = swapper._pipeline_occupancy()
+    assert occupancy["active_slot_count"] == 2
+    assert occupancy["lease_count"] == 2
+    assert occupancy["lease_buffer_count"] == 3
+    assert occupancy["allocated_buffer_count"] == 3
+    assert occupancy["state_buffer_count"] == 2
+    assert occupancy["pending_io_op_count"] == 3
+
+    swapper._log_pipeline_occupancy("disabled")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+    swapper.pipeline_occupancy_log_enabled = True
+    swapper._log_pipeline_occupancy("unit test")
+    captured = capsys.readouterr()
+    assert "Optimizer pipeline occupancy[0] unit test" in captured.out
+    assert "sync_swap_in(read,param=param0" in captured.out
+    assert "async_swap_out(write,param=param1" in captured.out

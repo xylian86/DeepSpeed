@@ -6,12 +6,14 @@
 Functionality of swapping optimizer tensors to/from (NVMe) storage devices.
 """
 
+import os
+
 from deepspeed.ops.op_builder import AsyncIOBuilder
 from deepspeed import comm as dist
 import torch
 
 from deepspeed.runtime.swap_tensor.constants import *
-from deepspeed.runtime.swap_tensor.utils import swap_in_tensors, swap_out_tensors, print_object
+from deepspeed.runtime.swap_tensor.utils import swap_in_tensors, swap_out_tensors, print_object, print_rank_0
 from deepspeed.runtime.swap_tensor.async_swapper import AsyncTensorSwapper
 from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerSwapper
 
@@ -45,11 +47,25 @@ class OptimizerSwapOp(object):
         self.buffer_leases = []
         return buffer_leases
 
+    def occupancy(self):
+        return {
+            'param_id': self.param_info.param_id,
+            'kind': 'read' if self.read_op else 'write',
+            'wait_required': self.wait_required,
+            'lease_count': len(self.buffer_leases),
+            'lease_buffer_count': sum(len(lease) for lease in self.buffer_leases),
+            'allocated_buffer_count': len(self.allocated_buffers),
+            'state_buffer_count': len(self.state_buffers),
+            'num_ops': self.num_ops,
+        }
+
 
 SYNC_SWAP_IN = 'sync_swap_in'
 ASYNC_SWAP_IN = 'async_swap_in'
 SYNC_SWAP_OUT = 'sync_swap_out'
 ASYNC_SWAP_OUT = 'async_swap_out'
+
+PIPELINE_OCCUPANCY_LOG_ENV = 'DEEPSPEED_NVME_PIPELINE_OCCUPANCY_LOG'
 
 SWAP_IN_STATE_TIMER = 'swap_in_state'
 SWAP_OUT_STATE_TIMER = 'swap_out_state'
@@ -86,9 +102,14 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
         self.async_swap_out = swap_config.pipeline_write
 
         self.swap_ops = {SYNC_SWAP_IN: None, ASYNC_SWAP_IN: None, SYNC_SWAP_OUT: None, ASYNC_SWAP_OUT: None}
+        self.pipeline_occupancy_events = 0
+        self.pipeline_occupancy_log_enabled = os.environ.get(PIPELINE_OCCUPANCY_LOG_ENV, '').lower() in [
+            '1', 'true', 'yes', 'on'
+        ]
 
         self.print_exclude_list += [
-            'gradient_swapper', 'read_aio_handle', 'write_aio_handle', 'swap_ops', 'print_exclude_list'
+            'gradient_swapper', 'read_aio_handle', 'write_aio_handle', 'swap_ops', 'pipeline_occupancy_events',
+            'pipeline_occupancy_log_enabled', 'print_exclude_list'
         ]
 
         if dist.get_rank() == 0:
@@ -134,11 +155,13 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
 
         self._stop_timer(SWAP_IN_STATE_TIMER)
         self.timer_names.add(SWAP_IN_STATE_TIMER)
+        self._log_pipeline_occupancy('after swap_in_optimizer_state')
 
     def swap_out_optimizer_state(self, parameter, async_swap):
         self._start_timer(SWAP_OUT_STATE_TIMER)
 
         if self.swap_ops[ASYNC_SWAP_OUT]:
+            self._log_pipeline_occupancy('before completing previous async swap-out')
             self._start_timer(ASYNC_SWAP_OUT_STATE_TIMER)
             self._complete_swap_out(ASYNC_SWAP_OUT)
             self._stop_timer(ASYNC_SWAP_OUT_STATE_TIMER)
@@ -159,6 +182,7 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
 
         self._stop_timer(SWAP_OUT_STATE_TIMER)
         self.timer_names.add(SWAP_OUT_STATE_TIMER)
+        self._log_pipeline_occupancy('after swap_out_optimizer_state')
 
     def swap_out_gradients(self, parameter, gradient_offsets, gradient_tensors):
         self._swap_out_gradients(parameter=parameter,
@@ -167,11 +191,64 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
                                  gradient_swapper=self.gradient_swapper)
 
     def _complete_swap_out(self, swap_out_type):
+        self._log_pipeline_occupancy(f'before complete {swap_out_type}')
         self.swap_ops[swap_out_type].wait()
         for buffer in self.swap_ops[swap_out_type].state_buffers:
             buffer = torch.Tensor()
         self.swap_ops[swap_out_type].release_buffers()
         self.swap_ops[swap_out_type] = None
+        self._log_pipeline_occupancy(f'after complete {swap_out_type}')
+
+    def _pipeline_slot_occupancy(self, swap_op):
+        if swap_op is None:
+            return None
+        return swap_op.occupancy()
+
+    def _pipeline_occupancy(self):
+        slots = {name: self._pipeline_slot_occupancy(op) for name, op in self.swap_ops.items()}
+        active_slots = [slot for slot in slots.values() if slot is not None]
+        return {
+            'slots': slots,
+            'active_slot_count': len(active_slots),
+            'lease_count': sum([slot['lease_count'] for slot in active_slots]),
+            'lease_buffer_count': sum([slot['lease_buffer_count'] for slot in active_slots]),
+            'allocated_buffer_count': sum([slot['allocated_buffer_count'] for slot in active_slots]),
+            'state_buffer_count': sum([slot['state_buffer_count'] for slot in active_slots]),
+            'pending_io_op_count': sum([slot['num_ops'] for slot in active_slots if slot['wait_required']]),
+        }
+
+    def _format_pipeline_slot_occupancy(self, name, slot):
+        if slot is None:
+            return f'{name}=None'
+        return (
+            f"{name}({slot['kind']},param={slot['param_id']},wait={slot['wait_required']},"
+            f"leases={slot['lease_count']},lease_buffers={slot['lease_buffer_count']},"
+            f"allocated_buffers={slot['allocated_buffer_count']},state_buffers={slot['state_buffer_count']},"
+            f"num_ops={slot['num_ops']})")
+
+    def _log_pipeline_occupancy(self, label):
+        if not getattr(self, 'pipeline_occupancy_log_enabled', False):
+            return
+
+        occupancy = self._pipeline_occupancy()
+        slot_summaries = [
+            self._format_pipeline_slot_occupancy(name, occupancy['slots'][name]) for name in [
+                SYNC_SWAP_IN,
+                ASYNC_SWAP_IN,
+                SYNC_SWAP_OUT,
+                ASYNC_SWAP_OUT,
+            ]
+        ]
+        summary = (
+            f"Optimizer pipeline occupancy[{self.pipeline_occupancy_events}] {label}: "
+            f"active_slots={occupancy['active_slot_count']}, "
+            f"leases={occupancy['lease_count']}, "
+            f"lease_buffers={occupancy['lease_buffer_count']}, "
+            f"allocated_buffers={occupancy['allocated_buffer_count']}, "
+            f"state_buffers={occupancy['state_buffer_count']}, "
+            f"pending_io_ops={occupancy['pending_io_op_count']} | " + " | ".join(slot_summaries))
+        self.pipeline_occupancy_events += 1
+        print_rank_0(summary, force=True)
 
     def _swap_out_optimizer_state(self, aio_handle, parameter, swap_in_op):
         assert swap_in_op.is_parameter(parameter)
