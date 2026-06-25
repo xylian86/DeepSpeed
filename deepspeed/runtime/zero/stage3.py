@@ -1676,6 +1676,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
     def reduce_ready_partitions_and_remove_grads(self, param):
         if self._coalesce_grad_reduction:
+            self.defer_coalesced_grad_reduction(self.get_param_id(param), param)
             return
         #print_rank_0(f"Backward {debug_param2name_id_shape(param)}", force=True)
         self.reduce_independent_p_g_buckets_and_remove_grads(param)

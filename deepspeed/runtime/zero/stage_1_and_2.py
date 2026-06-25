@@ -1549,12 +1549,18 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     def process_gradients(self, param, i):
         if self._coalesce_grad_reduction:
+            self.defer_coalesced_grad_reduction(self.get_param_id(param), (i, param))
             return
         self.setup_buckets()
         if self.use_grad_accum_attribute:
             self._fill_param_grad_accum_attribute(param)
         if self.partition_gradients or self.overlap_comm:
             self.reduce_ready_partitions_and_remove_grads(param, i)
+
+    def drain_coalesced_grad_reduction_params(self):
+        if not self._grad_acc_hooks:
+            return None
+        return super().drain_coalesced_grad_reduction_params()
 
     def reduce_ready_partitions_and_remove_grads(self, param, i):
         if self.partition_gradients or self.is_gradient_accumulation_boundary or self.zenflow:

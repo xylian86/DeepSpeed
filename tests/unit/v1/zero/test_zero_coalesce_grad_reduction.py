@@ -83,6 +83,18 @@ class _NullCtx:
         return False
 
 
+class _PartiallyUsedModel(torch.nn.Module):
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.used = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.unused = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.cross_entropy_loss = torch.nn.CrossEntropyLoss()
+
+    def forward(self, x, y):
+        return self.cross_entropy_loss(self.used(x), y)
+
+
 def _config_dtype(config):
     if config.get("fp16", {}).get("enabled"):
         return torch.float16
@@ -455,6 +467,55 @@ class TestCoalesceCollectiveCount(DistributedTest):
             f"ZeRO-{zero_stage}: coalesced issued {coalesced_total} collectives, "
             f"baseline {baseline_total} -- coalesce did not reduce count. "
             f"baseline={baseline} coalesced={coalesced}")
+
+
+class TestCoalesceDirtyParamTracking(DistributedTest):
+    world_size = 2
+
+    def test_zero2_flush_skips_unused_params(self, monkeypatch):
+        cfg = _config(zero_stage=2)
+        cfg["zero_optimization"]["ignore_unused_parameters"] = True
+        torch.manual_seed(42)
+        model = _PartiallyUsedModel(hidden_dim=8)
+        engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=cfg)
+
+        unused_param_ids = {id(param) for param in engine.module.unused.parameters()}
+        probed_unused_params = []
+        original_get_gradient = engine.optimizer.get_gradient_for_reduction
+        original_flush = engine._flush_coalesced_reduction_zero12
+        inside_flush = False
+
+        def get_gradient_spy(param):
+            if inside_flush and id(param) in unused_param_ids:
+                probed_unused_params.append(param)
+            return original_get_gradient(param)
+
+        def flush_spy(optimizer):
+            nonlocal inside_flush
+            inside_flush = True
+            try:
+                return original_flush(optimizer)
+            finally:
+                inside_flush = False
+
+        monkeypatch.setattr(engine.optimizer, "get_gradient_for_reduction", get_gradient_spy)
+        monkeypatch.setattr(engine, "_flush_coalesced_reduction_zero12", flush_spy)
+
+        batch = next(
+            iter(
+                random_dataloader(model=engine,
+                                  total_samples=1,
+                                  hidden_dim=8,
+                                  device=engine.device,
+                                  dtype=_config_dtype(cfg))))
+        with engine.coalesce_grad_reduction():
+            loss = engine(batch[0], batch[1])
+            engine.set_gradient_accumulation_boundary(True)
+            engine.backward(loss)
+        engine.step()
+        engine.destroy()
+
+        assert not probed_unused_params, "coalesced flush probed params whose backward hooks never fired"
 
 
 class TestCoalesceZero3MicroStepInvariant(DistributedTest):

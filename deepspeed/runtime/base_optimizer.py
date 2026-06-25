@@ -24,6 +24,20 @@ class ZeROOptimizer(DeepSpeedOptimizer):
         self._remaining_grad_acc_hooks = 0
         self._grad_acc_post_hooks = []
         self._backward_active_depth = 0
+        self._coalesced_grad_reduction_params = {}
+
+    def reset_coalesced_grad_reduction_params(self):
+        self._coalesced_grad_reduction_params.clear()
+
+    def defer_coalesced_grad_reduction(self, key, payload):
+        self._coalesced_grad_reduction_params.setdefault(key, payload)
+
+    def drain_coalesced_grad_reduction_params(self):
+        params = [
+            self._coalesced_grad_reduction_params[key] for key in sorted(self._coalesced_grad_reduction_params)
+        ]
+        self.reset_coalesced_grad_reduction_params()
+        return params
 
     def load_hp_checkpoint_state_from_checkpoint_dir(self, lp_groups_name: str, checkpoint_dir: str) -> None:
         checkpoint_dir = os.path.join(checkpoint_dir, "zero")

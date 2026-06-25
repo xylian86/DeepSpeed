@@ -2512,6 +2512,7 @@ class DeepSpeedEngine(Module):
         # only need to save/restore the engine flag.
         saved_engine_boundary = self._is_gradient_accumulation_boundary
         self.inside_no_sync_ctxt = True
+        optimizer.reset_coalesced_grad_reduction_params()
         optimizer._coalesce_grad_reduction = True
         try:
             yield
@@ -2549,17 +2550,18 @@ class DeepSpeedEngine(Module):
         # which is fine -- copy_grads_in_partition's accumulate condition uses
         # micro_step_id > 0 OR not boundary, and we force boundary=True.
         optimizer.setup_buckets()
-        for i, group in enumerate(optimizer.bit16_groups):
-            for param in group:
-                if not param.requires_grad:
-                    continue
-                # use_grad_accum_attribute=True parks the accumulated grad in
-                # param.grad_accum instead of param.grad (backward_epilogue
-                # routes it there each microbatch). get_gradient_for_reduction
-                # returns the right one for both modes.
-                if optimizer.get_gradient_for_reduction(param) is None:
-                    continue
-                optimizer.reduce_ready_partitions_and_remove_grads(param, i)
+        deferred_params = optimizer.drain_coalesced_grad_reduction_params()
+        if deferred_params is None:
+            deferred_params = ((i, param) for i, group in enumerate(optimizer.bit16_groups) for param in group
+                               if param.requires_grad)
+        for i, param in deferred_params:
+            # use_grad_accum_attribute=True parks the accumulated grad in
+            # param.grad_accum instead of param.grad (backward_epilogue routes
+            # it there each microbatch). get_gradient_for_reduction returns the
+            # right one for both modes.
+            if optimizer.get_gradient_for_reduction(param) is None:
+                continue
+            optimizer.reduce_ready_partitions_and_remove_grads(param, i)
         optimizer.overlapping_partition_gradients_reduce_epilogue()
 
     def _flush_coalesced_reduction_zero3(self, optimizer):
@@ -2567,10 +2569,9 @@ class DeepSpeedEngine(Module):
         # the leaf module's own backward hook, BEFORE the reducer call we
         # suppress. So by flush time the leaf params already have grads (real
         # or zero-filled) populated by the hook regardless of _coalesce_grad_reduction.
-        for group in optimizer.fp16_groups:
-            for param in group:
-                if param.requires_grad and param.grad is not None:
-                    optimizer.reduce_ready_partitions_and_remove_grads(param)
+        for param in optimizer.drain_coalesced_grad_reduction_params():
+            if param.requires_grad and param.grad is not None:
+                optimizer.reduce_ready_partitions_and_remove_grads(param)
         optimizer.independent_gradient_partition_epilogue()
 
     def scale(self, loss):
