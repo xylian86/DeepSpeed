@@ -16,6 +16,7 @@ from deepspeed.ops.op_builder import AsyncIOBuilder
 from deepspeed.ops.op_builder import GDSBuilder
 from .constants import *
 from .utils import swap_in_tensors, swap_out_tensors, MIN_AIO_BYTES, AIO_ALIGNED_BYTES, print_object, SwapBufferPool
+from .lookahead_dram_cache import LookaheadDRAMCache
 
 
 def print_rank_0(message, debug=False, force=False):
@@ -120,6 +121,8 @@ class AsyncPartitionedParameterSwapper(object):
                                                 overlap_events=self.aio_config[AIO_OVERLAP_EVENTS],
                                                 intra_op_parallelism=self.aio_config[AIO_INTRA_OP_PARALLELISM])
 
+        self.lookahead_cache = self._configure_lookahead_cache(ds_config)
+
         buffer_device = get_accelerator().device_name() if self.use_gds else "cpu"
         self.buffers = torch.empty(int(self.aligned_elements_per_buffer * self.param_buffer_count),
                                    dtype=self.dtype,
@@ -131,6 +134,87 @@ class AsyncPartitionedParameterSwapper(object):
             self.buffers = get_accelerator().pin_memory(self.buffers, align_bytes=0)
 
         self.swap_out_params = []
+
+    def _configure_lookahead_cache(self, ds_config):
+        cache_config = getattr(ds_config, "superrl_cache_config", None)
+        if not getattr(cache_config, "enabled", False):
+            return None
+
+        aio_op = AsyncIOBuilder().load(verbose=False)
+        aio_read_handle = aio_op.aio_handle(block_size=self.aio_config[AIO_BLOCK_SIZE],
+                                            queue_depth=self.aio_config[AIO_QUEUE_DEPTH],
+                                            single_submit=self.aio_config[AIO_SINGLE_SUBMIT],
+                                            overlap_events=self.aio_config[AIO_OVERLAP_EVENTS],
+                                            intra_op_parallelism=self.aio_config[AIO_INTRA_OP_PARALLELISM])
+        cache = LookaheadDRAMCache(enabled=True,
+                                   dtype=self.dtype,
+                                   aio_handle=aio_read_handle,
+                                   pin_memory_fn=get_accelerator().pin_memory,
+                                   aligned_numel_fn=self._io_aligned_numel,
+                                   max_prefetches_per_call=max(1, self.aio_config[AIO_QUEUE_DEPTH]),
+                                   max_inflight_prefetches=max(1, 2 * self.aio_config[AIO_QUEUE_DEPTH]))
+        print_rank_0(
+            f"SuperRL-Cache enabled for NVMe params, host memory envelope={cache.memory_cap_bytes / (1024**3):.2f} GiB",
+            force=True)
+        return cache
+
+    def cache_enabled(self):
+        return self.lookahead_cache is not None and self.lookahead_cache.enabled
+
+    def prefetch_cache_for_trace(self, ordered_params):
+        if not self.cache_enabled():
+            return
+
+        cache_params = [param for param in ordered_params if getattr(param, "nvme_swapper", None) is self]
+        self.lookahead_cache.prefetch(cache_params, path_fn=lambda param: self.get_path(param, must_exist=True))
+
+    def log_cache_stats(self, trace_len=None):
+        if not self.cache_enabled():
+            return
+        if trace_len is not None:
+            self.lookahead_cache.trace_len = max(self.lookahead_cache.trace_len, trace_len)
+        print_rank_0(str(self.lookahead_cache.stats()), force=True)
+
+    def invalidate_cache(self, params):
+        if self.cache_enabled():
+            self.lookahead_cache.invalidate(params)
+
+    def _mark_params_available(self, params, numel=None):
+        if numel is None:
+            numel = sum(self.param_id_to_numel[param.ds_id] for param in params)
+        newly_available = []
+        for param in params:
+            if param.ds_id not in self.available_params:
+                self.available_params.add(param.ds_id)
+                newly_available.append(param)
+        if len(newly_available) == len(params):
+            self.available_numel += numel
+        else:
+            self.available_numel += sum(self.param_id_to_numel[param.ds_id] for param in newly_available)
+
+    def _mark_params_not_available(self, params):
+        for param in params:
+            param_id = param.ds_id
+            if param_id in self.available_params:
+                self.available_params.remove(param_id)
+                self.available_numel -= self.param_id_to_numel[param_id]
+
+    def _swap_in_from_cache(self, params):
+        if not self.cache_enabled():
+            return params
+
+        cache_misses = []
+        for param in params:
+            compute_buffer = self.lookahead_cache.acquire(param)
+            if compute_buffer is None:
+                cache_misses.append(param)
+                continue
+
+            self.param_id_to_numel[param.ds_id] = param.ds_tensor.ds_numel
+            param.ds_tensor.data = compute_buffer.data
+            param.ds_tensor.status = PartitionedParamStatus.AVAILABLE
+            self._mark_params_available([param], numel=compute_buffer.numel())
+        return cache_misses
 
     #Check if partitioned param or numel in a tensor is swappable or not
     def swappable_tensor(self, param=None, numel=None):
@@ -224,8 +308,7 @@ class AsyncPartitionedParameterSwapper(object):
             param.ds_tensor.data = compute_buffer.data
             param.ds_tensor.status = PartitionedParamStatus.AVAILABLE
 
-        self.available_params.update([param.ds_id for param in self.inflight_params])
-        self.available_numel += self.inflight_numel
+        self._mark_params_available(self.inflight_params, numel=self.inflight_numel)
 
         self.inflight_params = []
         self.inflight_swap_in_buffers = []
@@ -248,15 +331,15 @@ class AsyncPartitionedParameterSwapper(object):
                 del self.param_id_to_swap_buffer[param_id]
                 print_rank_0(f"param {param.ds_id} releases buffer id {buffer_id}  ")
 
-                if param_id in self.available_params:
-                    self.available_params.remove(param_id)
-                    self.available_numel -= self.param_id_to_numel[param_id]
-
+            self._mark_params_not_available([param])
             param.ds_tensor.data = self.invalid_buffer.data
             param.ds_tensor.status = PartitionedParamStatus.NOT_AVAILABLE
+            if self.cache_enabled():
+                self.lookahead_cache.on_param_detached(param)
 
     #writes from in memory to nvme. Does not release the buffers
     def _swap_out(self, params, async_op=True):
+        self.invalidate_cache(params)
 
         swap_out_paths = self._get_swap_paths(params)
         swap_out_params = self._get_swap_buffers(params)
@@ -292,6 +375,11 @@ class AsyncPartitionedParameterSwapper(object):
 
         assert all([param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE
                     for param in params]), "Some params are already available or in flight"
+        if swap_in_buffers is None:
+            params = self._swap_in_from_cache(params)
+            if not params:
+                return
+
         swap_in_paths = self._get_swap_paths(params)
 
         if swap_in_buffers is None:
@@ -403,6 +491,8 @@ class AsyncPartitionedParameterSwapper(object):
         assert self.partitioned_swap_pool is not None, 'partitioned swap pool for fp16 params not initialized'
         assert len(dst_fp16_params) == len(src_fp32_params), \
         f'mismatch in number of fp16 params {len(dst_fp16_params)} and fp32 params {len(src_fp32_params)}'
+
+        self.invalidate_cache(dst_fp16_params)
 
         fp16_swap_paths = self._get_swap_paths(dst_fp16_params, must_exist=True)
         self.synchronize_writes()

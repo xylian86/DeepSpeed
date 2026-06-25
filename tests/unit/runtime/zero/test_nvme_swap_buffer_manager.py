@@ -10,7 +10,10 @@ import torch
 
 from deepspeed.runtime.swap_tensor import utils as swap_utils
 from deepspeed.runtime.swap_tensor import optimizer_utils as optimizer_swap_utils
+from deepspeed.runtime.swap_tensor.lookahead_dram_cache import LookaheadDRAMCache
 from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerSwapper, split_swap_buffer_counts
+from deepspeed.runtime.swap_tensor.partitioned_param_swapper import AsyncPartitionedParameterSwapper, \
+    PartitionedParamStatus
 from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import ASYNC_SWAP_IN, ASYNC_SWAP_OUT, SYNC_SWAP_IN, \
     SYNC_SWAP_OUT, OptimizerSwapOp, PipelinedOptimizerSwapper
 
@@ -25,7 +28,9 @@ class _FakeAIOHandle:
 
     def __init__(self):
         self.writes = []
+        self.reads = []
         self.pending_writes = 0
+        self.pending_reads = 0
         self.wait_counts = []
 
     def async_pwrite(self, buffer, path, offset):
@@ -33,10 +38,16 @@ class _FakeAIOHandle:
         self.pending_writes += 1
         return 0
 
+    def async_pread(self, buffer, path, offset):
+        self.reads.append((buffer, path, offset))
+        self.pending_reads += 1
+        return 0
+
     def wait(self):
-        wait_count = self.pending_writes
+        wait_count = self.pending_writes + self.pending_reads
         self.wait_counts.append(wait_count)
         self.pending_writes = 0
+        self.pending_reads = 0
         return wait_count
 
 
@@ -47,6 +58,25 @@ class _DummyLease:
 
     def __len__(self):
         return len(self.buffers)
+
+
+class _FakeLookaheadCache:
+
+    enabled = True
+
+    def __init__(self, compute_buffer):
+        self.compute_buffer = compute_buffer
+        self.detached_params = []
+        self.invalidated_params = []
+
+    def acquire(self, param):
+        return self.compute_buffer
+
+    def on_param_detached(self, param):
+        self.detached_params.append(param.ds_id)
+
+    def invalidate(self, params):
+        self.invalidated_params.extend(param.ds_id for param in params)
 
 
 def _patch_swap_buffer_manager_deps(monkeypatch):
@@ -180,6 +210,72 @@ def test_swap_buffer_lease_releases_once(monkeypatch):
 
     with pytest.raises(RuntimeError, match="released more than once"):
         lease.release()
+
+
+def test_lookahead_dram_cache_prefetches_nearest_future_uses(monkeypatch):
+    _patch_swap_buffer_manager_deps(monkeypatch)
+
+    not_available = SimpleNamespace(name="NOT_AVAILABLE")
+
+    def make_param(param_id):
+        return SimpleNamespace(ds_id=param_id,
+                               ds_tensor=SimpleNamespace(ds_numel=1, status=not_available))
+
+    params = [make_param(param_id) for param_id in range(3)]
+    aio_handle = _FakeAIOHandle()
+    cache = LookaheadDRAMCache(enabled=True,
+                               dtype=torch.float32,
+                               aio_handle=aio_handle,
+                               pin_memory_fn=lambda tensor, align_bytes=0: tensor,
+                               aligned_numel_fn=lambda numel: numel,
+                               host_memory_limit_bytes_fn=lambda: 9,
+                               process_rss_bytes_fn=lambda: 0,
+                               max_prefetches_per_call=8,
+                               max_inflight_prefetches=8)
+
+    cache.prefetch(params, path_fn=lambda param: f"param-{param.ds_id}.swp")
+    assert set(cache.entries.keys()) == {0, 1}
+    assert len(aio_handle.reads) == 2
+
+    cache.synchronize_reads()
+    assert cache.acquire(params[0]) is not None
+
+    cache.prefetch(params[1:], path_fn=lambda param: f"param-{param.ds_id}.swp")
+    assert set(cache.entries.keys()) == {1, 2}
+    assert cache.stats()["superrl_cache/hits"] == 1
+    assert cache.stats()["superrl_cache/evictions"] == 1
+
+
+def test_partitioned_param_swapper_cache_hit_releases_accounting():
+    compute_buffer = torch.empty(2, dtype=torch.float32)
+    cache = _FakeLookaheadCache(compute_buffer)
+    swapper = AsyncPartitionedParameterSwapper.__new__(AsyncPartitionedParameterSwapper)
+    swapper.lookahead_cache = cache
+    swapper.param_id_to_numel = {}
+    swapper.param_id_to_buffer_id = {}
+    swapper.param_id_to_swap_buffer = {}
+    swapper.available_params = set()
+    swapper.available_numel = 0
+    swapper.invalid_buffer = torch.empty(1, dtype=torch.float32)
+
+    param = SimpleNamespace(ds_id=7,
+                            ds_tensor=SimpleNamespace(ds_numel=2,
+                                                      status=PartitionedParamStatus.NOT_AVAILABLE,
+                                                      data=torch.empty(1, dtype=torch.float32).data))
+
+    swapper.swap_in([param], async_op=False)
+
+    assert param.ds_tensor.status == PartitionedParamStatus.AVAILABLE
+    assert param.ds_tensor.data.data_ptr() == compute_buffer.data_ptr()
+    assert swapper.available_params == {7}
+    assert swapper.available_numel == 2
+
+    swapper.remove_partition_and_release_buffers([param])
+
+    assert param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE
+    assert swapper.available_params == set()
+    assert swapper.available_numel == 0
+    assert cache.detached_params == [7]
 
 
 def test_split_swap_buffer_counts_preserves_total_pipeline_budget():

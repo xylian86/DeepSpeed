@@ -263,6 +263,7 @@ class PartitionedParameterCoordinator:
         self.__step_id = 0
         self.__n_available_params = 0
         self.__profiler.reset_events()
+        self.__log_nvme_cache_stats()
 
     def _dump_params(self, tag, sub_module, params, step_id=None):
         if step_id is None:
@@ -566,6 +567,18 @@ class PartitionedParameterCoordinator:
         if not self.is_complete_trace():
             return
 
+        cache_prefetch_params = collections.OrderedDict()
+        for param_in_trace in self.__param_queue:
+            param = param_in_trace.param
+            nvme_swapper = getattr(param, "nvme_swapper", None)
+            if nvme_swapper is not None and hasattr(nvme_swapper, "cache_enabled") and nvme_swapper.cache_enabled():
+                cache_prefetch_params.setdefault(nvme_swapper, []).append(param)
+
+        if cache_prefetch_params:
+            for nvme_swapper, params in cache_prefetch_params.items():
+                nvme_swapper.prefetch_cache_for_trace(params)
+            return
+
         numel_in_flight = sum(param.ds_numel for param in self.__inflight_param_registry)
 
         numel_considered = 0
@@ -583,3 +596,15 @@ class PartitionedParameterCoordinator:
 
         if swap_in_params:
             swap_in_params[0].nvme_swapper.swap_in(swap_in_params, async_op=True)
+
+    def __log_nvme_cache_stats(self):
+        if not self.is_complete_trace():
+            return
+
+        logged_swappers = set()
+        for param_in_trace in self.__param_order:
+            nvme_swapper = getattr(param_in_trace.param, "nvme_swapper", None)
+            if nvme_swapper is None or nvme_swapper in logged_swappers or not hasattr(nvme_swapper, "log_cache_stats"):
+                continue
+            logged_swappers.add(nvme_swapper)
+            nvme_swapper.log_cache_stats(trace_len=len(self.__param_order))

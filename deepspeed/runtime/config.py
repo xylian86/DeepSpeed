@@ -488,6 +488,24 @@ def get_memory_breakdown(param_dict):
     return get_scalar_param(param_dict, MEMORY_BREAKDOWN, MEMORY_BREAKDOWN_DEFAULT)
 
 
+class DeepSpeedSuperRLCacheConfig:
+
+    def __init__(self, enabled=False):
+        self.enabled = enabled
+
+    def __repr__(self):
+        return f"DeepSpeedSuperRLCacheConfig(enabled={self.enabled})"
+
+
+def get_superrl_cache_config(param_dict):
+    value = param_dict.get("superrl_cache", False)
+    if isinstance(value, bool):
+        return DeepSpeedSuperRLCacheConfig(enabled=value)
+    if isinstance(value, dict):
+        return DeepSpeedSuperRLCacheConfig(enabled=bool(value.get("enabled", False)))
+    raise ValueError("DeepSpeedConfig: superrl_cache must be a boolean or an object with an enabled field")
+
+
 class HybridEngineConfig(DeepSpeedConfigModel):
     enabled: bool = False
     max_out_tokens: int = 512
@@ -856,6 +874,7 @@ class DeepSpeedConfig(object):
         self.checkpoint_parallel_write_pipeline = par_write_pipe
 
         self.aio_config = get_aio_config(param_dict)
+        self.superrl_cache_config = get_superrl_cache_config(param_dict)
 
         self.dataloader_drop_last = get_dataloader_drop_last(param_dict)
 

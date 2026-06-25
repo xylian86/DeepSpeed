@@ -6,6 +6,7 @@
 import pytest
 from pydantic import ValidationError
 
+from deepspeed.runtime.config import get_superrl_cache_config
 from deepspeed.runtime.zero.config import DeepSpeedZeroConfig, DeepSpeedZeroOffloadParamConfig, DeepSpeedZeroOffloadOptimizerConfig
 
 
@@ -61,6 +62,19 @@ def test_zero_config_offload_configs():
     config = DeepSpeedZeroConfig(**{"offload_param": {}, "offload_optimizer": {}})
     assert isinstance(config.offload_param, DeepSpeedZeroOffloadParamConfig)
     assert isinstance(config.offload_optimizer, DeepSpeedZeroOffloadOptimizerConfig)
+
+
+def test_superrl_cache_config_uses_single_boolean_control():
+    assert get_superrl_cache_config({}).enabled is False
+    assert get_superrl_cache_config({"superrl_cache": True}).enabled is True
+    assert get_superrl_cache_config({"superrl_cache": False}).enabled is False
+
+    # Existing artifact configs used an object form. Keep it as a compatibility
+    # alias, but only the enabled flag controls behavior.
+    assert get_superrl_cache_config({"superrl_cache": {"enabled": True, "dram_budget_bytes": 1}}).enabled is True
+
+    with pytest.raises(ValueError, match="superrl_cache must be a boolean"):
+        get_superrl_cache_config({"superrl_cache": "true"})
 
 
 def test_zero_offload_optimizer_config_pipeline():
