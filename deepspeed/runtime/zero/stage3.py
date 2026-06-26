@@ -1213,7 +1213,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
                 self.fp32_partitioned_groups_flat[i].grad = subgroup_gradient_buffer.to(self.subgroup_to_device[i])
             else:
-                self.fp32_partitioned_groups_flat[i].grad = gradient_buffer.narrow(0, 0, num_elements)
+                subgroup_gradient_buffer = gradient_buffer.narrow(0, 0, num_elements)
+                target_device = self.fp32_partitioned_groups_flat[i].device
+                if subgroup_gradient_buffer.device != target_device:
+                    subgroup_gradient_buffer = subgroup_gradient_buffer.to(target_device)
+                self.fp32_partitioned_groups_flat[i].grad = subgroup_gradient_buffer
 
             if swappable_param_subgroup:
                 self._partitioned_params_swap_out(i)

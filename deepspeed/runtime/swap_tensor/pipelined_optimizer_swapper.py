@@ -261,6 +261,23 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
         try:
             param_info = swap_in_op.param_info
             self._update_param_state_info(param_info, parameter)
+            unbound_direct_tensors = param_info.unbound_direct_tensor_count()
+            if unbound_direct_tensors:
+                aligned_numel = self._io_aligned_numel(param_info.numel())
+                lazy_state_lease = self.swap_buffer_manager.allocate_lease(num_elems=aligned_numel,
+                                                                           count=unbound_direct_tensors,
+                                                                           dtype=parameter.dtype,
+                                                                           owner='pipelined optimizer lazy state')
+                if lazy_state_lease is None:
+                    raise RuntimeError(
+                        self.swap_buffer_manager.allocation_failure_message(
+                            requested_num_elems=aligned_numel,
+                            requested_count=unbound_direct_tensors,
+                            owner='pipelined optimizer lazy state'))
+                buffer_leases.append(lazy_state_lease)
+                allocated_buffers += lazy_state_lease.buffers
+                param_info.bind_unbound_direct_swap_buffers(lazy_state_lease.buffers, aligned_numel)
+
             unpinned_tensors = param_info.get_unpinned_state_tensors()
 
             if len(unpinned_tensors) > 0:

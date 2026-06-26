@@ -106,6 +106,21 @@ class OptimizerStateSwapInfo(object):
         self.has_state_tensors = True
         self._add_tensors(tensor_list)
 
+    def unbound_direct_tensor_count(self):
+        return sum(1 for t in self.tensors if is_direct_io_buffer(t.compute_tensor) and t.swap_tensor.numel() == 0)
+
+    def bind_unbound_direct_swap_buffers(self, buffers, aligned_numel):
+        contexts = [t for t in self.tensors if is_direct_io_buffer(t.compute_tensor) and t.swap_tensor.numel() == 0]
+        assert len(contexts) <= len(buffers)
+        compute_lengths = [self.numel()] * len(contexts)
+        swap_lengths = [aligned_numel] * len(contexts)
+        compute_buffers = get_sized_buffers(buffers, compute_lengths)
+        swap_buffers = get_sized_buffers(buffers, swap_lengths)
+
+        for context, compute_buffer, swap_buffer in zip(contexts, compute_buffers, swap_buffers):
+            compute_buffer.data.copy_(context.compute_tensor.data)
+            context.set_buffers(compute_buffer=compute_buffer, swap_buffer=swap_buffer)
+
     def num_tensors(self):
         return len(self.tensors)
 
