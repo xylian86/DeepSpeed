@@ -17,6 +17,7 @@ from deepspeed.ops.op_builder import GDSBuilder
 from .constants import *
 from .utils import swap_in_tensors, swap_out_tensors, MIN_AIO_BYTES, AIO_ALIGNED_BYTES, print_object, SwapBufferPool
 from .lookahead_dram_cache import LookaheadDRAMCache
+from deepspeed.runtime.zero.offload_config import resolve_nvme_path
 
 
 def print_rank_0(message, debug=False, force=False):
@@ -84,7 +85,10 @@ class AsyncPartitionedParameterSwapper(object):
     def _configure_aio(self, ds_config):
         self.swap_config = ds_config.zero_config.offload_param
         torch_dtype_string = str(self.dtype).split(".")[1]
-        self.swap_folder = os.path.join(self.swap_config.nvme_path, 'zero_stage_3', f'{torch_dtype_string}params',
+        nvme_path = resolve_nvme_path(self.swap_config)
+        if nvme_path is None:
+            raise ValueError("ZeRO-3 NVMe parameter offload requires nvme_path or nvme_path_per_local_rank.")
+        self.swap_folder = os.path.join(nvme_path, 'zero_stage_3', f'{torch_dtype_string}params',
                                         f'rank{dist.get_rank()}')
         shutil.rmtree(self.swap_folder, ignore_errors=True)
         os.makedirs(self.swap_folder, exist_ok=True)

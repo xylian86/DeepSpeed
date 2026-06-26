@@ -4,10 +4,12 @@
 # DeepSpeed Team
 
 import pytest
+from pathlib import Path
 from pydantic import ValidationError
 
 from deepspeed.runtime.config import get_superrl_cache_config, get_superrl_io_config, get_superrl_sync_config
 from deepspeed.runtime.zero.config import DeepSpeedZeroConfig, DeepSpeedZeroOffloadParamConfig, DeepSpeedZeroOffloadOptimizerConfig
+from deepspeed.runtime.zero.offload_config import has_nvme_path, resolve_nvme_path
 
 
 def test_zero_config_deprecatedfields():
@@ -62,6 +64,36 @@ def test_zero_config_offload_configs():
     config = DeepSpeedZeroConfig(**{"offload_param": {}, "offload_optimizer": {}})
     assert isinstance(config.offload_param, DeepSpeedZeroOffloadParamConfig)
     assert isinstance(config.offload_optimizer, DeepSpeedZeroOffloadOptimizerConfig)
+
+
+def test_zero_offload_config_nvme_path_per_local_rank(monkeypatch):
+    config = DeepSpeedZeroConfig(**{
+        "offload_param": {
+            "device": "nvme",
+            "nvme_path_per_local_rank": ["/mnt/raid0/ds_swap", "/mnt/raid1/ds_swap"],
+        },
+        "offload_optimizer": {
+            "device": "nvme",
+            "nvme_path": "/mnt/fallback/ds_swap",
+            "nvme_path_per_local_rank": ["/mnt/raid0/ds_swap", "/mnt/raid1/ds_swap"],
+            "buffer_count": 4,
+        },
+    })
+
+    assert has_nvme_path(config.offload_param) is True
+    assert config.offload_param.nvme_path is None
+    assert config.offload_param.nvme_path_per_local_rank == [
+        Path("/mnt/raid0/ds_swap"),
+        Path("/mnt/raid1/ds_swap"),
+    ]
+
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    assert resolve_nvme_path(config.offload_param) == Path("/mnt/raid1/ds_swap")
+    assert resolve_nvme_path(config.offload_optimizer) == Path("/mnt/raid1/ds_swap")
+
+    monkeypatch.setenv("LOCAL_RANK", "2")
+    with pytest.raises(ValueError, match="LOCAL_RANK=2"):
+        resolve_nvme_path(config.offload_param)
 
 
 def test_superrl_cache_config_uses_single_boolean_control():

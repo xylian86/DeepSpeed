@@ -78,6 +78,23 @@ def test_superrl_io_accepts_successful_gds_probe():
                                 probe_fn=probe_fn)
 
 
+def test_superrl_io_uses_per_local_rank_nvme_path(monkeypatch):
+    monkeypatch.setenv("LOCAL_RANK", "1")
+
+    def probe_fn(nvme_path, aio_config):
+        assert str(nvme_path) == "/mnt/raid1/ds_swap"
+        assert aio_config[AIO_QUEUE_DEPTH] == 8
+        return GDSProbeResult(ok=True, message="ok")
+
+    ensure_superrl_io_gds_ready(SimpleNamespace(enabled=True),
+                                SimpleNamespace(device="nvme",
+                                                nvme_path="/mnt/fallback/ds_swap",
+                                                nvme_path_per_local_rank=["/mnt/raid0/ds_swap",
+                                                                          "/mnt/raid1/ds_swap"]),
+                                _aio_config(),
+                                probe_fn=probe_fn)
+
+
 def test_superrl_io_swap_config_enables_hidden_pipeline_defaults():
     config = make_superrl_io_swap_config(
         SimpleNamespace(buffer_count=4, buffer_size=12345, pipeline=False, pipeline_read=False, pipeline_write=False))

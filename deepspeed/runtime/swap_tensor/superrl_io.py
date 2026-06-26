@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.swap_tensor.constants import AIO_BLOCK_SIZE, AIO_INTRA_OP_PARALLELISM, AIO_OVERLAP_EVENTS, \
     AIO_QUEUE_DEPTH, AIO_SINGLE_SUBMIT
+from deepspeed.runtime.zero.offload_config import resolve_nvme_path
 
 SUPERRL_IO_MIN_OPTIMIZER_BUFFER_COUNT = 16
 
@@ -173,9 +174,10 @@ def ensure_superrl_io_gds_ready(superrl_io_config, offload_optimizer_config, aio
         raise ValueError(
             f"SuperRL-IO requires zero_optimization.offload_optimizer.device='nvme', got {optimizer_device!r}.")
 
-    nvme_path = getattr(offload_optimizer_config, "nvme_path", None)
+    nvme_path = resolve_nvme_path(offload_optimizer_config)
     if nvme_path is None:
-        raise ValueError("SuperRL-IO requires zero_optimization.offload_optimizer.nvme_path.")
+        raise ValueError("SuperRL-IO requires zero_optimization.offload_optimizer.nvme_path or "
+                         "nvme_path_per_local_rank.")
 
     result = probe_fn(nvme_path, aio_config)
     if not result.ok:

@@ -4,14 +4,42 @@
 # DeepSpeed Team
 
 from enum import Enum
+import os
 from pathlib import Path
 from pydantic import Field, model_validator
-from typing import Optional
+from typing import List, Optional
 
 from deepspeed.runtime.config_utils import DeepSpeedConfigModel, pp_int
 
 
 ADAM_OPTIMIZER_STATE_BUFFER_COUNT = 4
+
+
+def local_rank_from_env():
+    for name in ("LOCAL_RANK", "OMPI_COMM_WORLD_LOCAL_RANK", "SLURM_LOCALID"):
+        value = os.environ.get(name)
+        if value is not None:
+            return int(value)
+    return 0
+
+
+def has_nvme_path(offload_config):
+    if offload_config is None:
+        return False
+    return getattr(offload_config, "nvme_path", None) is not None or bool(
+        getattr(offload_config, "nvme_path_per_local_rank", None))
+
+
+def resolve_nvme_path(offload_config, local_rank=None):
+    per_local_rank = getattr(offload_config, "nvme_path_per_local_rank", None)
+    if per_local_rank:
+        if local_rank is None:
+            local_rank = local_rank_from_env()
+        if local_rank < 0 or local_rank >= len(per_local_rank):
+            raise ValueError(
+                f"LOCAL_RANK={local_rank} cannot use nvme_path_per_local_rank with {len(per_local_rank)} path(s).")
+        return per_local_rank[local_rank]
+    return getattr(offload_config, "nvme_path", None)
 
 
 class OffloadDeviceEnum(str, Enum):
@@ -32,6 +60,9 @@ class DeepSpeedZeroOffloadParamConfig(DeepSpeedConfigModel):
 
     nvme_path: Optional[Path] = None
     """ Filesystem path for NVMe device for parameter offloading. """
+
+    nvme_path_per_local_rank: Optional[List[Path]] = None
+    """ Filesystem paths for NVMe parameter offload, indexed by LOCAL_RANK. """
 
     buffer_count: int = Field(5, ge=0)
     """ Number of buffers in buffer pool for parameter offloading to NVMe. """
@@ -63,6 +94,9 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
 
     nvme_path: Optional[Path] = None
     """ Filesystem path for NVMe device for optimizer state offloading. """
+
+    nvme_path_per_local_rank: Optional[List[Path]] = None
+    """ Filesystem paths for NVMe optimizer offload, indexed by LOCAL_RANK. """
 
     buffer_count: int = Field(4, ge=0)
     """

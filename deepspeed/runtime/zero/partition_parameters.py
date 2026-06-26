@@ -26,7 +26,7 @@ import deepspeed
 from ..utils import see_memory_usage, get_only_unique_item
 from deepspeed.runtime.zero.config import DeepSpeedZeroConfig
 from deepspeed.runtime.zero.utils import assert_ints_same_as_other_ranks, is_zero_param
-from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
+from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum, has_nvme_path
 from deepspeed.runtime.config_utils import get_config_default
 from deepspeed.utils import instrument_w_nvtx, logger
 from deepspeed.comm.comm import init_distributed
@@ -1134,8 +1134,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 assert ds_config.zero_config.offload_param is not None, \
                 f'"offload_param" must be defined in DeepSpeed Config if remote device is {OffloadDeviceEnum.nvme}.'
 
-                assert ds_config.zero_config.offload_param.nvme_path is not None, \
-                f'"nvme_path" in DeepSpeed Config cannot be None if remote device is {OffloadDeviceEnum.nvme}'
+                assert has_nvme_path(ds_config.zero_config.offload_param), \
+                f'"nvme_path" or "nvme_path_per_local_rank" in DeepSpeed Config cannot be None if remote device is {OffloadDeviceEnum.nvme}'
 
     def _post_init_method(self, module):
         #see_memory_usage(f"Before converting params in {module.__class__.__name__}", force=False)

@@ -24,7 +24,7 @@ from deepspeed.runtime.comm.coalesced_collectives import reduce_scatter_coalesce
 from deepspeed.runtime.utils import inf, is_model_parallel_parameter, get_only_unique_item, mask_nan_or_inf_with_val_inplace, count_used_parameters_in_backward
 from deepspeed.runtime.zero.partition_parameters import *
 from deepspeed.runtime.zero.config import ZeroStageEnum
-from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum, OffloadStateTypeEnum
+from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum, OffloadStateTypeEnum, resolve_nvme_path
 from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
 import deepspeed.runtime.zenflow.engine_stage3 as zf_engine_stage3
 from deepspeed.runtime.zero.utils import get_mapping_to_flat_buffer
@@ -741,7 +741,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         return optimizer
 
     def _configure_tensor_swapping(self, offload_optimizer_config, aio_config):
-        nvme_swap_folder = os.path.join(offload_optimizer_config.nvme_path, 'zero_stage_3')
+        nvme_path = resolve_nvme_path(offload_optimizer_config)
+        if nvme_path is None:
+            raise ValueError("ZeRO-3 NVMe optimizer offload requires nvme_path or nvme_path_per_local_rank.")
+        nvme_swap_folder = os.path.join(nvme_path, 'zero_stage_3')
         os.makedirs(nvme_swap_folder, exist_ok=True)
         if dist.get_rank() == 0:
             logger.info('Tensor Swapping: Adding optimizer tensors')
