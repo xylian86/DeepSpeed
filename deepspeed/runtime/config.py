@@ -506,13 +506,36 @@ def get_superrl_cache_config(param_dict):
     raise ValueError("DeepSpeedConfig: superrl_cache must be a boolean or an object with an enabled field")
 
 
+def _get_optional_positive_int(value, name):
+    if value is None:
+        return None
+    value = int(value)
+    if value < 1:
+        raise ValueError(f"DeepSpeedConfig: {name} must be >= 1")
+    return value
+
+
 class DeepSpeedSuperRLIOConfig:
 
-    def __init__(self, enabled=False):
+    def __init__(self,
+                 enabled=False,
+                 pipeline_read=True,
+                 pipeline_write=True,
+                 prefetch_depth=1,
+                 read_thread_count=None,
+                 write_thread_count=None):
         self.enabled = enabled
+        self.pipeline_read = pipeline_read
+        self.pipeline_write = pipeline_write
+        self.prefetch_depth = max(1, int(prefetch_depth))
+        self.read_thread_count = _get_optional_positive_int(read_thread_count, "superrl_io.read_thread_count")
+        self.write_thread_count = _get_optional_positive_int(write_thread_count, "superrl_io.write_thread_count")
 
     def __repr__(self):
-        return f"DeepSpeedSuperRLIOConfig(enabled={self.enabled})"
+        return (f"DeepSpeedSuperRLIOConfig(enabled={self.enabled}, "
+                f"pipeline_read={self.pipeline_read}, pipeline_write={self.pipeline_write}, "
+                f"prefetch_depth={self.prefetch_depth}, read_thread_count={self.read_thread_count}, "
+                f"write_thread_count={self.write_thread_count})")
 
 
 def get_superrl_io_config(param_dict):
@@ -520,7 +543,12 @@ def get_superrl_io_config(param_dict):
     if isinstance(value, bool):
         return DeepSpeedSuperRLIOConfig(enabled=value)
     if isinstance(value, dict):
-        return DeepSpeedSuperRLIOConfig(enabled=bool(value.get("enabled", False)))
+        return DeepSpeedSuperRLIOConfig(enabled=bool(value.get("enabled", False)),
+                                        pipeline_read=bool(value.get("pipeline_read", True)),
+                                        pipeline_write=bool(value.get("pipeline_write", True)),
+                                        prefetch_depth=value.get("prefetch_depth", 1),
+                                        read_thread_count=value.get("read_thread_count", None),
+                                        write_thread_count=value.get("write_thread_count", None))
     raise ValueError("DeepSpeedConfig: superrl_io must be a boolean or an object with an enabled field")
 
 
@@ -540,6 +568,40 @@ def get_superrl_sync_config(param_dict):
     if isinstance(value, dict):
         return DeepSpeedSuperRLSyncConfig(enabled=bool(value.get("enabled", False)))
     raise ValueError("DeepSpeedConfig: superrl_sync must be a boolean or an object with an enabled field")
+
+
+class DeepSpeedSuperRLLowHostMemConfig:
+
+    def __init__(self,
+                 enabled=False,
+                 optimizer_buffer_count=5,
+                 disable_optimizer_pipeline=True,
+                 disable_superrl_io=True):
+        self.enabled = enabled
+        self.optimizer_buffer_count = optimizer_buffer_count
+        self.disable_optimizer_pipeline = disable_optimizer_pipeline
+        self.disable_superrl_io = disable_superrl_io
+
+    def __repr__(self):
+        return ("DeepSpeedSuperRLLowHostMemConfig("
+                f"enabled={self.enabled}, "
+                f"optimizer_buffer_count={self.optimizer_buffer_count}, "
+                f"disable_optimizer_pipeline={self.disable_optimizer_pipeline}, "
+                f"disable_superrl_io={self.disable_superrl_io})")
+
+
+def get_superrl_low_host_mem_config(param_dict):
+    value = param_dict.get("superrl_low_host_mem", False)
+    if isinstance(value, bool):
+        return DeepSpeedSuperRLLowHostMemConfig(enabled=value)
+    if isinstance(value, dict):
+        return DeepSpeedSuperRLLowHostMemConfig(
+            enabled=bool(value.get("enabled", False)),
+            optimizer_buffer_count=int(value.get("optimizer_buffer_count", 5)),
+            disable_optimizer_pipeline=bool(value.get("disable_optimizer_pipeline", True)),
+            disable_superrl_io=bool(value.get("disable_superrl_io", True)),
+        )
+    raise ValueError("DeepSpeedConfig: superrl_low_host_mem must be a boolean or an object with an enabled field")
 
 
 class HybridEngineConfig(DeepSpeedConfigModel):
@@ -918,6 +980,7 @@ class DeepSpeedConfig(object):
         self.superrl_cache_config = get_superrl_cache_config(param_dict)
         self.superrl_io_config = get_superrl_io_config(param_dict)
         self.superrl_sync_config = get_superrl_sync_config(param_dict)
+        self.superrl_low_host_mem_config = get_superrl_low_host_mem_config(param_dict)
 
         self.dataloader_drop_last = get_dataloader_drop_last(param_dict)
 

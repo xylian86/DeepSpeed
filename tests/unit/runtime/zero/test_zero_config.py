@@ -8,6 +8,8 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from deepspeed.runtime.config import get_superrl_cache_config, get_superrl_io_config, get_superrl_sync_config
+from deepspeed.runtime.swap_tensor.aio_config import get_aio_config
+from deepspeed.runtime.swap_tensor.constants import AIO_IO_BACKEND, AIO_IO_BACKEND_ASYNC, AIO_IO_BACKEND_POSIX
 from deepspeed.runtime.zero.config import DeepSpeedZeroConfig, DeepSpeedZeroOffloadParamConfig, DeepSpeedZeroOffloadOptimizerConfig
 from deepspeed.runtime.zero.offload_config import has_nvme_path, resolve_nvme_path
 
@@ -66,7 +68,22 @@ def test_zero_config_offload_configs():
     assert isinstance(config.offload_optimizer, DeepSpeedZeroOffloadOptimizerConfig)
 
 
+def test_aio_config_io_backend():
+    assert get_aio_config({})[AIO_IO_BACKEND] == AIO_IO_BACKEND_ASYNC
+    assert get_aio_config({"aio": {"io_backend": "deepnvme"}})[AIO_IO_BACKEND] == AIO_IO_BACKEND_ASYNC
+    assert get_aio_config({"aio": {"io_backend": "simple"}})[AIO_IO_BACKEND] == AIO_IO_BACKEND_POSIX
+    assert get_aio_config({"aio": {"io_backend": "posix"}})[AIO_IO_BACKEND] == AIO_IO_BACKEND_POSIX
+
+    with pytest.raises(ValueError, match="Invalid aio.io_backend"):
+        get_aio_config({"aio": {"io_backend": "unknown"}})
+
+    with pytest.raises(ValueError, match="requires aio.io_backend='async_io'"):
+        get_aio_config({"aio": {"io_backend": "posix", "use_gds": True}})
+
+
 def test_zero_offload_config_nvme_path_per_local_rank(monkeypatch):
+    monkeypatch.setenv("LOCAL_RANK", "1")
+
     config = DeepSpeedZeroConfig(**{
         "offload_param": {
             "device": "nvme",
@@ -74,26 +91,35 @@ def test_zero_offload_config_nvme_path_per_local_rank(monkeypatch):
         },
         "offload_optimizer": {
             "device": "nvme",
-            "nvme_path": "/mnt/fallback/ds_swap",
             "nvme_path_per_local_rank": ["/mnt/raid0/ds_swap", "/mnt/raid1/ds_swap"],
             "buffer_count": 4,
         },
     })
 
     assert has_nvme_path(config.offload_param) is True
-    assert config.offload_param.nvme_path is None
+    assert config.offload_param.nvme_path == Path("/mnt/raid1/ds_swap")
+    assert config.offload_optimizer.nvme_path == Path("/mnt/raid1/ds_swap")
     assert config.offload_param.nvme_path_per_local_rank == [
         Path("/mnt/raid0/ds_swap"),
         Path("/mnt/raid1/ds_swap"),
     ]
 
-    monkeypatch.setenv("LOCAL_RANK", "1")
     assert resolve_nvme_path(config.offload_param) == Path("/mnt/raid1/ds_swap")
     assert resolve_nvme_path(config.offload_optimizer) == Path("/mnt/raid1/ds_swap")
 
+    # Parsed configs keep the rank-local nvme_path fixed even if the process
+    # environment changes later.
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    assert resolve_nvme_path(config.offload_param) == Path("/mnt/raid1/ds_swap")
+
     monkeypatch.setenv("LOCAL_RANK", "2")
     with pytest.raises(ValueError, match="LOCAL_RANK=2"):
-        resolve_nvme_path(config.offload_param)
+        DeepSpeedZeroConfig(**{
+            "offload_param": {
+                "device": "nvme",
+                "nvme_path_per_local_rank": ["/mnt/raid0/ds_swap", "/mnt/raid1/ds_swap"],
+            },
+        })
 
 
 def test_superrl_cache_config_uses_single_boolean_control():
@@ -114,9 +140,21 @@ def test_superrl_io_config_uses_single_boolean_control():
     assert get_superrl_io_config({"superrl_io": True}).enabled is True
     assert get_superrl_io_config({"superrl_io": False}).enabled is False
 
-    # Older artifact configs used an object form. Keep it as a compatibility
-    # alias, but the public SuperRL-IO control is the single boolean.
-    assert get_superrl_io_config({"superrl_io": {"enabled": True, "queue_depth": 32}}).enabled is True
+    # Object form remains compatible and can carry read/write GDS tuning.
+    config = get_superrl_io_config({"superrl_io": {
+        "enabled": True,
+        "queue_depth": 32,
+        "prefetch_depth": 2,
+        "read_thread_count": 8,
+        "write_thread_count": 2,
+    }})
+    assert config.enabled is True
+    assert config.prefetch_depth == 2
+    assert config.read_thread_count == 8
+    assert config.write_thread_count == 2
+
+    with pytest.raises(ValueError, match="read_thread_count"):
+        get_superrl_io_config({"superrl_io": {"enabled": True, "read_thread_count": 0}})
 
     with pytest.raises(ValueError, match="superrl_io must be a boolean"):
         get_superrl_io_config({"superrl_io": "true"})

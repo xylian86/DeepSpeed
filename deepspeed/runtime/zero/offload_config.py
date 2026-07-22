@@ -13,6 +13,7 @@ from deepspeed.runtime.config_utils import DeepSpeedConfigModel, pp_int
 
 
 ADAM_OPTIMIZER_STATE_BUFFER_COUNT = 4
+NVME_PATH_RESOLVED_FROM_PER_LOCAL_RANK = "_nvme_path_resolved_from_per_local_rank"
 
 
 def local_rank_from_env():
@@ -31,6 +32,10 @@ def has_nvme_path(offload_config):
 
 
 def resolve_nvme_path(offload_config, local_rank=None):
+    nvme_path = getattr(offload_config, "nvme_path", None)
+    if getattr(offload_config, NVME_PATH_RESOLVED_FROM_PER_LOCAL_RANK, False) and nvme_path is not None:
+        return nvme_path
+
     per_local_rank = getattr(offload_config, "nvme_path_per_local_rank", None)
     if per_local_rank:
         if local_rank is None:
@@ -39,7 +44,23 @@ def resolve_nvme_path(offload_config, local_rank=None):
             raise ValueError(
                 f"LOCAL_RANK={local_rank} cannot use nvme_path_per_local_rank with {len(per_local_rank)} path(s).")
         return per_local_rank[local_rank]
-    return getattr(offload_config, "nvme_path", None)
+    return nvme_path
+
+
+def set_nvme_path_from_per_local_rank(offload_config, local_rank=None):
+    per_local_rank = getattr(offload_config, "nvme_path_per_local_rank", None)
+    if not per_local_rank:
+        return offload_config
+
+    if local_rank is None:
+        local_rank = local_rank_from_env()
+    if local_rank < 0 or local_rank >= len(per_local_rank):
+        raise ValueError(
+            f"LOCAL_RANK={local_rank} cannot use nvme_path_per_local_rank with {len(per_local_rank)} path(s).")
+
+    offload_config.__dict__["nvme_path"] = per_local_rank[local_rank]
+    offload_config.__dict__[NVME_PATH_RESOLVED_FROM_PER_LOCAL_RANK] = True
+    return offload_config
 
 
 class OffloadDeviceEnum(str, Enum):
@@ -81,6 +102,10 @@ class DeepSpeedZeroOffloadParamConfig(DeepSpeedConfigModel):
     Offload to page-locked CPU memory. This could boost throughput at the cost
     of extra memory overhead.
     """
+
+    @model_validator(mode="after")
+    def set_rank_local_nvme_path(self):
+        return set_nvme_path_from_per_local_rank(self)
 
 
 class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
@@ -145,6 +170,7 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
 
     @model_validator(mode="after")
     def set_pipeline(self):
+        set_nvme_path_from_per_local_rank(self)
         pipeline = self.pipeline_read or self.pipeline_write
         self.__dict__["pipeline"] = pipeline
         if self.device == OffloadDeviceEnum.nvme and pipeline:

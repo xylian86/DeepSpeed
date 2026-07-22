@@ -1148,6 +1148,9 @@ class DeepSpeedEngine(Module):
     def superrl_sync_config(self):
         return self._config.superrl_sync_config
 
+    def superrl_low_host_mem_config(self):
+        return self._config.superrl_low_host_mem_config
+
     def zenflow_config(self):
         return self._config.zero_config.zenflow
 
@@ -1992,6 +1995,7 @@ class DeepSpeedEngine(Module):
                     gradient_accumulation_steps=self.gradient_accumulation_steps(),
                     aio_config=self.aio_config(),
                     superrl_io_config=self.superrl_io_config(),
+                    superrl_low_host_mem_config=self.superrl_low_host_mem_config(),
                     gradient_accumulation_dtype=gradient_accumulation_dtype,
                     communication_data_type=self.communication_data_type,
                     fp16_master_weights_and_gradients=self.fp16_master_weights_and_gradients(),

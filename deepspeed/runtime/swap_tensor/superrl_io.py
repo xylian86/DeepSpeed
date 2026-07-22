@@ -19,10 +19,11 @@ from dataclasses import dataclass
 
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.swap_tensor.constants import AIO_BLOCK_SIZE, AIO_INTRA_OP_PARALLELISM, AIO_OVERLAP_EVENTS, \
-    AIO_QUEUE_DEPTH, AIO_SINGLE_SUBMIT
+    AIO_QUEUE_DEPTH, AIO_SINGLE_SUBMIT, AIO_THREAD_COUNT
 from deepspeed.runtime.zero.offload_config import resolve_nvme_path
 
 SUPERRL_IO_MIN_OPTIMIZER_BUFFER_COUNT = 16
+SUPERRL_IO_BUFFERS_PER_PREFETCH = 4
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,17 @@ def _tail(text, limit=2000):
     return text[-limit:]
 
 
-def probe_gds_path(nvme_path, aio_config, timeout_sec=45):
+def _with_parallelism(aio_config, parallelism):
+    if parallelism is None:
+        return aio_config
+    config = copy.copy(aio_config)
+    parallelism = max(1, int(parallelism))
+    config[AIO_INTRA_OP_PARALLELISM] = parallelism
+    config[AIO_THREAD_COUNT] = parallelism
+    return config
+
+
+def probe_gds_path(nvme_path, aio_config, timeout_sec=None):
     """Return whether cuFile can register and move data for ``nvme_path``.
 
     DeepSpeed's current GDS extension exits the process on some cuFile failures.
@@ -141,11 +152,15 @@ def probe_gds_path(nvme_path, aio_config, timeout_sec=45):
         str(probe_bytes),
     ]
 
+    if timeout_sec is None:
+        timeout_sec = int(os.environ.get("SUPERRL_GDS_PROBE_TIMEOUT_SEC", "120"))
+
     try:
         completed = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec, check=False)
     except subprocess.TimeoutExpired as exc:
+        details = " ".join(part for part in [_tail(exc.stdout), _tail(exc.stderr)] if part).strip()
         return GDSProbeResult(ok=False,
-                              message=f"GDS probe timed out after {timeout_sec}s for {nvme_path}: {_tail(exc.stderr)}")
+                              message=f"GDS probe timed out after {timeout_sec}s for {nvme_path}: {details}")
 
     if completed.returncode == 0:
         return GDSProbeResult(ok=True,
@@ -179,7 +194,8 @@ def ensure_superrl_io_gds_ready(superrl_io_config, offload_optimizer_config, aio
         raise ValueError("SuperRL-IO requires zero_optimization.offload_optimizer.nvme_path or "
                          "nvme_path_per_local_rank.")
 
-    result = probe_fn(nvme_path, aio_config)
+    probe_aio_config = _with_parallelism(aio_config, getattr(superrl_io_config, "read_thread_count", None))
+    result = probe_fn(nvme_path, probe_aio_config)
     if not result.ok:
         raise RuntimeError(
             "SuperRL-IO was enabled, but real GPUDirect Storage is not usable on the optimizer NVMe path. "
@@ -187,17 +203,28 @@ def ensure_superrl_io_gds_ready(superrl_io_config, offload_optimizer_config, aio
             f"{result.message}")
 
 
-def make_superrl_io_swap_config(swap_config):
+def make_superrl_io_swap_config(swap_config, superrl_io_config=None):
     """Return an internal optimizer swap config for the SuperRL-IO pipeline.
 
     The user-facing control remains ``superrl_io: true``. The hidden defaults
-    below make that switch imply double-buffered read/write pipelining with
-    enough buffer slots for Adam state, next-read, previous-write, and staging.
+    below make that switch imply read/write pipelining with enough buffer slots
+    for Adam state, configured read prefetches, previous-write, and staging.
     """
     config = copy.copy(swap_config)
-    config.__dict__["pipeline_read"] = True
-    config.__dict__["pipeline_write"] = True
-    config.__dict__["pipeline"] = True
-    config.__dict__["buffer_count"] = max(int(getattr(config, "buffer_count", 0)),
-                                          SUPERRL_IO_MIN_OPTIMIZER_BUFFER_COUNT)
+    pipeline_read = True if superrl_io_config is None else bool(getattr(superrl_io_config, "pipeline_read", True))
+    pipeline_write = True if superrl_io_config is None else bool(getattr(superrl_io_config, "pipeline_write", True))
+    config.__dict__["pipeline_read"] = pipeline_read
+    config.__dict__["pipeline_write"] = pipeline_write
+    config.__dict__["pipeline"] = pipeline_read or pipeline_write
+    read_thread_count = None if superrl_io_config is None else getattr(superrl_io_config, "read_thread_count", None)
+    write_thread_count = None if superrl_io_config is None else getattr(superrl_io_config, "write_thread_count", None)
+    prefetch_depth = 1 if superrl_io_config is None else max(1, int(getattr(superrl_io_config, "prefetch_depth", 1)))
+    config.__dict__["gds_prefetch_depth"] = prefetch_depth
+    if read_thread_count is not None:
+        config.__dict__["gds_read_intra_op_parallelism"] = int(read_thread_count)
+    if write_thread_count is not None:
+        config.__dict__["gds_write_intra_op_parallelism"] = int(write_thread_count)
+    min_buffer_count = SUPERRL_IO_MIN_OPTIMIZER_BUFFER_COUNT + \
+        (prefetch_depth - 1) * SUPERRL_IO_BUFFERS_PER_PREFETCH
+    config.__dict__["buffer_count"] = max(int(getattr(config, "buffer_count", 0)), min_buffer_count)
     return config

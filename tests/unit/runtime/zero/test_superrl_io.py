@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from deepspeed.runtime.swap_tensor.constants import AIO_BLOCK_SIZE, AIO_INTRA_OP_PARALLELISM, AIO_OVERLAP_EVENTS, \
-    AIO_QUEUE_DEPTH, AIO_SINGLE_SUBMIT
+    AIO_QUEUE_DEPTH, AIO_SINGLE_SUBMIT, AIO_THREAD_COUNT
 from deepspeed.runtime.swap_tensor.superrl_io import GDSProbeResult, ensure_superrl_io_gds_ready, \
     make_superrl_io_swap_config, probe_gds_path
 
@@ -20,6 +20,7 @@ def _aio_config():
         AIO_SINGLE_SUBMIT: False,
         AIO_OVERLAP_EVENTS: True,
         AIO_INTRA_OP_PARALLELISM: 1,
+        AIO_THREAD_COUNT: 1,
     }
 
 
@@ -58,10 +59,11 @@ def test_superrl_io_fails_when_gds_probe_fails():
     def probe_fn(nvme_path, aio_config):
         assert str(nvme_path) == "/tmp/nvme"
         assert aio_config[AIO_QUEUE_DEPTH] == 8
+        assert aio_config[AIO_INTRA_OP_PARALLELISM] == 4
         return GDSProbeResult(ok=False, message="NVMe: Unsupported")
 
     with pytest.raises(RuntimeError, match="real GPUDirect Storage is not usable"):
-        ensure_superrl_io_gds_ready(SimpleNamespace(enabled=True),
+        ensure_superrl_io_gds_ready(SimpleNamespace(enabled=True, read_thread_count=4),
                                     SimpleNamespace(device="nvme", nvme_path="/tmp/nvme"),
                                     _aio_config(),
                                     probe_fn=probe_fn)
@@ -97,13 +99,17 @@ def test_superrl_io_uses_per_local_rank_nvme_path(monkeypatch):
 
 def test_superrl_io_swap_config_enables_hidden_pipeline_defaults():
     config = make_superrl_io_swap_config(
-        SimpleNamespace(buffer_count=4, buffer_size=12345, pipeline=False, pipeline_read=False, pipeline_write=False))
+        SimpleNamespace(buffer_count=4, buffer_size=12345, pipeline=False, pipeline_read=False, pipeline_write=False),
+        SimpleNamespace(prefetch_depth=2, read_thread_count=8, write_thread_count=2))
 
     assert config.pipeline is True
     assert config.pipeline_read is True
     assert config.pipeline_write is True
-    assert config.buffer_count == 16
+    assert config.buffer_count == 20
     assert config.buffer_size == 12345
+    assert config.gds_prefetch_depth == 2
+    assert config.gds_read_intra_op_parallelism == 8
+    assert config.gds_write_intra_op_parallelism == 2
 
 
 def test_gds_probe_requires_cuda_accelerator(monkeypatch):
