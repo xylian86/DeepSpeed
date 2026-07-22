@@ -5,8 +5,10 @@
 
 import sys
 import gc
+import copy
 import collections
 import itertools
+import os
 from typing import Deque, Dict, Set, List, Tuple, Container, Optional
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -47,6 +49,7 @@ OPTIMIZER_SWAP_IN_STATE_TIMER = 'optimizer_swap_in_state'
 INIT_OPTIMIZER_TIMER = 'init_optimizer_state'
 OPTIMIZER_SWAP_OUT_STATE_TIMER = 'optimizer_swap_out_state'
 OPTIMIZER_STEP_TIMER = 'optimizer_step'
+SUPERRL_LOW_HOST_MEM_OPTIMIZER_BUFFER_COUNT = 5
 
 
 def print_rank_0(message, debug=False, force=False):
@@ -56,6 +59,16 @@ def print_rank_0(message, debug=False, force=False):
     # other variations
     # - print for all ranks w/o interleaving
     # printflock(f"[{rank}] {message}")
+
+
+def print_superrl_optimizer_debug(message):
+    if os.environ.get("SUPERRL_DEBUG_OPTIMIZER_STEP", "").lower() not in ["1", "true", "yes", "on"]:
+        return
+    try:
+        rank = dist.get_rank()
+    except Exception:
+        rank = -1
+    print(f"SUPERRL_OPT_DEBUG rank={rank} {message}", flush=True)
     # - print to log file per rank
     # log_rank_file(rank, message)
 
@@ -179,6 +192,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         elastic_checkpoint=False,
         aio_config=None,
         superrl_io_config=None,
+        superrl_low_host_mem_config=None,
         all2all_process_group=None,
         zero_hpz_partition_size=1,
         zero_quantized_weights=False,
@@ -314,6 +328,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.superrl_io_config = superrl_io_config
         self.superrl_io_enabled = getattr(superrl_io_config, "enabled", False)
         self.superrl_io_optimizer = self._configure_superrl_io_optimizer() if self.superrl_io_enabled else None
+        self.superrl_low_host_mem_config = superrl_low_host_mem_config
+        self.superrl_low_host_mem_enabled = getattr(superrl_low_host_mem_config, "enabled", False)
+        self.superrl_low_host_mem_grad_partitions = False
 
         ### streams used for overlapping computation with communication
         self.reduce_and_partition_stream = None if get_accelerator().is_synchronized_device() else get_accelerator(
@@ -626,6 +643,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         all_params = list(itertools.chain.from_iterable(self.fp16_groups))
 
+        self.superrl_low_host_mem_grad_partitions = self.superrl_low_host_mem_enabled and self.offload_optimizer
+        if self.superrl_low_host_mem_grad_partitions:
+            if dist.get_rank() == 0:
+                logger.info("SuperRL low_host_mem enabled: using lazy ZeRO-3 gradient partition buffers")
+            return
+
         self.grad_partitions_flat_buffer: Tensor = torch.zeros(sum(p.partition_numel() for p in all_params),
                                                                dtype=self.gradient_accumulation_dtype,
                                                                device=self.device)
@@ -749,13 +772,26 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if dist.get_rank() == 0:
             logger.info('Tensor Swapping: Adding optimizer tensors')
 
-        ensure_superrl_io_gds_ready(self.superrl_io_config, offload_optimizer_config, aio_config)
+        low_host_mem = self.superrl_low_host_mem_enabled and self.offload_optimizer
+        disable_superrl_io_for_low_host = low_host_mem and getattr(self.superrl_low_host_mem_config,
+                                                                  "disable_superrl_io", True)
+        effective_superrl_io = self.superrl_io_enabled and not disable_superrl_io_for_low_host
+        if effective_superrl_io:
+            ensure_superrl_io_gds_ready(self.superrl_io_config, offload_optimizer_config, aio_config)
 
         swapper_optimizer = self.optimizer
         swap_config = offload_optimizer_config
-        if self.superrl_io_enabled:
+        if low_host_mem:
+            swap_config = self._make_superrl_low_host_mem_optimizer_swap_config(offload_optimizer_config)
+            swapper_type = PipelinedOptimizerSwapper if swap_config.pipeline else PartitionedOptimizerSwapper
+            if disable_superrl_io_for_low_host and self.superrl_io_enabled:
+                if dist.get_rank() == 0:
+                    logger.info(
+                        "SuperRL low_host_mem enabled: using non-pipelined optimizer NVMe swapper and "
+                        "disabling SuperRL-IO because the current GDS optimizer swapper is pipelined.")
+        elif effective_superrl_io:
             swapper_type = SuperRLPipelinedGDSOptimizerSwapper
-            swap_config = make_superrl_io_swap_config(offload_optimizer_config)
+            swap_config = make_superrl_io_swap_config(offload_optimizer_config, self.superrl_io_config)
             swapper_optimizer = self.superrl_io_optimizer
         else:
             swapper_type = PipelinedOptimizerSwapper if offload_optimizer_config.pipeline \
@@ -769,6 +805,29 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                                               device=self.device,
                                               dtype=self.master_weights_and_grads_dtype,
                                               timers=self.timers)
+
+    def _make_superrl_low_host_mem_optimizer_swap_config(self, offload_optimizer_config):
+        config = copy.copy(offload_optimizer_config)
+        low_host_config = self.superrl_low_host_mem_config
+        optimizer_buffer_count = max(
+            SUPERRL_LOW_HOST_MEM_OPTIMIZER_BUFFER_COUNT,
+            int(getattr(low_host_config, "optimizer_buffer_count", SUPERRL_LOW_HOST_MEM_OPTIMIZER_BUFFER_COUNT)),
+        )
+        if getattr(low_host_config, "disable_optimizer_pipeline", True):
+            config.__dict__["pipeline_read"] = False
+            config.__dict__["pipeline_write"] = False
+            config.__dict__["pipeline"] = False
+        config.__dict__["buffer_count"] = optimizer_buffer_count
+        config.__dict__["pin_memory"] = True
+        if dist.get_rank() == 0:
+            logger.info("SuperRL low_host_mem enabled: optimizer NVMe swapper "
+                        f"pipeline_read={config.pipeline_read}, pipeline_write={config.pipeline_write}, "
+                        f"buffer_count={config.buffer_count}")
+        return config
+
+    def _superrl_low_host_mem_disables_optimizer_pipeline(self):
+        return self.superrl_low_host_mem_enabled and getattr(self.superrl_low_host_mem_config,
+                                                            "disable_optimizer_pipeline", True)
 
     def _move_to_flat_buffer(self, param_list, flat_buffer, avoid_copy=False):
         '''If flat buffer is None then the parameters in the param_list are
@@ -1110,6 +1169,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     def _optimizer_step(self, sub_group_id):
         param_group_id = self.sub_group_to_group_id[sub_group_id]
         fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
+        print_superrl_optimizer_debug(
+            f"optimizer_step_begin sub_group={sub_group_id} param_group={param_group_id} "
+            f"numel={fp32_param.numel()} superrl_io={self.superrl_io_enabled}")
 
         def step_with_gradscaler(optimizer):
             if self.torch_autocast_gradscaler:
@@ -1139,6 +1201,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self.optimizer.param_groups[param_group_id]['params'] = [fp32_param]
             step_with_gradscaler(self.optimizer)
             self.optimizer.param_groups[param_group_id]['params'] = []
+        print_superrl_optimizer_debug(f"optimizer_step_end sub_group={sub_group_id}")
 
     def _swappable_optimizer_subgroup(self, sub_group_id):
         if not self.swap_optimizer:
@@ -1579,6 +1642,46 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 norm += part.data.double().norm(2)**2.0
         return norm**0.5
 
+    def _using_superrl_low_host_mem_grad_partitions(self):
+        return getattr(self, "superrl_low_host_mem_grad_partitions", False)
+
+    def _get_grad_partition_buffer(self, param, grad_partition):
+        if not self._using_superrl_low_host_mem_grad_partitions():
+            return self.__param_id_to_grad_partition[param.ds_id].narrow(0, 0, grad_partition.numel())
+
+        grad_buffer = self.__param_id_to_grad_partition.get(param.ds_id)
+        if grad_buffer is None or grad_buffer.numel() != param.partition_numel():
+            grad_buffer = torch.zeros(param.partition_numel(),
+                                      dtype=self.gradient_accumulation_dtype,
+                                      device=self.device)
+            self.__param_id_to_grad_partition[param.ds_id] = grad_buffer
+        return grad_buffer.narrow(0, 0, grad_partition.numel())
+
+    def _use_direct_grad_partition_buffer(self):
+        return self._using_superrl_low_host_mem_grad_partitions() and self.micro_step_id == 0 and \
+            self.is_gradient_accumulation_boundary
+
+    def _release_grad_partition_buffer(self, param):
+        if self._using_superrl_low_host_mem_grad_partitions():
+            self.__param_id_to_grad_partition.pop(param.ds_id, None)
+
+    def _track_lazy_grad_overflow(self, grad_buffer):
+        if not self._using_superrl_low_host_mem_grad_partitions() or self.dtype != torch.float16:
+            return
+
+        has_inf_or_nan = torch.logical_or(torch.isinf(grad_buffer).any(), torch.isnan(grad_buffer).any())
+        has_inf_or_nan = has_inf_or_nan.to(self.inf_or_nan_tracker.device)
+        if hasattr(self.inf_or_nan_tracker, "logical_or_"):
+            self.inf_or_nan_tracker.logical_or_(has_inf_or_nan)
+        else:
+            self.inf_or_nan_tracker += has_inf_or_nan
+            self.inf_or_nan_tracker = self.inf_or_nan_tracker > 0
+
+    def get_lp_grad_partition_devices(self):
+        if self.grad_partitions_flat_buffer is not None:
+            return {self.grad_partitions_flat_buffer.device}
+        return {grad.device for grad in self.__param_id_to_grad_partition.values()}
+
     def set_norm_for_param_grad_in_gpu(self, param):
         param_id = self.get_param_id(param)
         #self.norm_for_param_grads[param_id] = param.grad.data.double().norm(2)
@@ -1620,6 +1723,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     def partition_grads(self, params_to_release: List[Parameter], grad_partitions: List[Tensor]) -> None:
         offload_fp32_gradients = {}
         offload_fp32_offsets = {}
+        releasable_grad_params = []
         buffers = []
         for param, grad_partition in zip(params_to_release, grad_partitions):
 
@@ -1630,30 +1734,35 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 continue
 
             # move or accumulate gradient partition to target buffer
-            grad_buffer = self.__param_id_to_grad_partition[param.ds_id].narrow(0, 0, grad_partition.numel())
-            buffers.append(grad_buffer)
-            if self.micro_step_id == 0:  # don't accumulate
-                grad_buffer.copy_(grad_partition, non_blocking=True)
-                # ensure grad buffer is a CUDA buffer to speed up the next few
-                # operations and so it can be used asynchronously
-                grad_buffer = grad_buffer.to(grad_partition.device, non_blocking=True)
-            elif get_accelerator().on_accelerator(grad_buffer):
-                grad_buffer.add_(grad_partition.to(self.gradient_accumulation_dtype).view(grad_buffer.shape))
+            if self._use_direct_grad_partition_buffer():
+                grad_buffer = grad_partition.to(self.gradient_accumulation_dtype)
+                buffers.append(grad_buffer)
             else:
-                # if dst is CPU, copy first to src device, do the addition
-                # there, then move back to dst. adding directly to cpu is very slow
-                cuda_grad_buffer = grad_buffer.to(grad_partition.device, non_blocking=True)
-                cuda_grad_buffer.add_(grad_partition.to(self.gradient_accumulation_dtype).view(cuda_grad_buffer.shape))
-                grad_buffer.copy_(cuda_grad_buffer, non_blocking=True)
-                # ensure grad buffer is a CUDA buffer to speed up the next few
-                # operations and so it can be used asynchronously
-                grad_buffer = cuda_grad_buffer
+                grad_buffer = self._get_grad_partition_buffer(param, grad_partition)
+                buffers.append(grad_buffer)
+                if self.micro_step_id == 0:  # don't accumulate
+                    grad_buffer.copy_(grad_partition, non_blocking=True)
+                    # ensure grad buffer is a CUDA buffer to speed up the next few
+                    # operations and so it can be used asynchronously
+                    grad_buffer = grad_buffer.to(grad_partition.device, non_blocking=True)
+                elif get_accelerator().on_accelerator(grad_buffer):
+                    grad_buffer.add_(grad_partition.to(self.gradient_accumulation_dtype).view(grad_buffer.shape))
+                else:
+                    # if dst is CPU, copy first to src device, do the addition
+                    # there, then move back to dst. adding directly to cpu is very slow
+                    cuda_grad_buffer = grad_buffer.to(grad_partition.device, non_blocking=True)
+                    cuda_grad_buffer.add_(grad_partition.to(self.gradient_accumulation_dtype).view(cuda_grad_buffer.shape))
+                    grad_buffer.copy_(cuda_grad_buffer, non_blocking=True)
+                    # ensure grad buffer is a CUDA buffer to speed up the next few
+                    # operations and so it can be used asynchronously
+                    grad_buffer = cuda_grad_buffer
 
             # offload the gradient partition if applicable
             if self.offload_optimizer:
                 i, dest_offset, _ = self.grad_position[self.get_param_id(param)]
 
                 if self.is_gradient_accumulation_boundary:
+                    self._track_lazy_grad_overflow(grad_buffer)
                     self.norm_for_param_grads[self.get_param_id(param)] = self._constant_buffered_norm2(grad_buffer)
 
                     if self._swappable_optimizer_subgroup(i):
@@ -1667,6 +1776,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                         fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
                             0, dest_offset, grad_buffer.numel())
                         fp32_grad_tensor.copy_(grad_buffer.to(dtype=self.master_weights_and_grads_dtype))
+                    releasable_grad_params.append(param)
 
             # free the gradient
             if not get_accelerator().is_synchronized_device():
@@ -1679,6 +1789,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 self.optimizer_swapper.swap_out_gradients(parameter=self.fp32_partitioned_groups_flat[i],
                                                           gradient_offsets=offload_fp32_offsets[i],
                                                           gradient_tensors=offload_fp32_gradients[i])
+        for param in releasable_grad_params:
+            self._release_grad_partition_buffer(param)
         return buffers
 
     def reduce_ready_partitions_and_remove_grads(self, param):
@@ -2022,6 +2134,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
     def reset_cpu_buffers(self):
         self.norm_for_param_grads = {}
+        if self._using_superrl_low_host_mem_grad_partitions():
+            self.__param_id_to_grad_partition.clear()
 
     def _pre_step(self):
         self.micro_step_id = 0
@@ -2081,6 +2195,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         assert self._swappable_optimizer_subgroup(sub_group_id), \
             f'Parameter {fp32_param_id} of numel={param_length} is not swappable'
 
+        print_superrl_optimizer_debug(
+            f"swap_in_begin sub_group={sub_group_id} fp32_param_id={fp32_param_id} numel={param_length}")
         see_memory_usage(f'pre-step Before swapping in optimizer tensors {sub_group_id}', force=False)
         if timer_names is not None:
             timer_names.add(OPTIMIZER_SWAP_IN_STATE_TIMER)
@@ -2088,11 +2204,26 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         self.optimizer_swapper.swap_in_optimizer_state(
             parameter=self.fp32_partitioned_groups_flat[sub_group_id],
-            async_parameter=self.next_swappable_fp32_partitioned_groups[sub_group_id])
+            async_parameter=None if self._superrl_low_host_mem_disables_optimizer_pipeline() else
+            self._next_swappable_fp32_partitioned_groups(sub_group_id))
 
         if timer_names is not None:
             self.timers(OPTIMIZER_SWAP_IN_STATE_TIMER).stop()
         see_memory_usage(f'pre-step After swapping in optimizer tensors {sub_group_id}', force=False)
+        print_superrl_optimizer_debug(f"swap_in_end sub_group={sub_group_id}")
+
+    def _next_swappable_fp32_partitioned_groups(self, sub_group_id):
+        prefetch_depth = max(1, int(getattr(self.superrl_io_config, "prefetch_depth", 1)))
+        if prefetch_depth == 1:
+            return self.next_swappable_fp32_partitioned_groups[sub_group_id]
+
+        next_groups = []
+        for next_sub_group_id in range(sub_group_id + 1, len(self.fp32_partitioned_groups_flat)):
+            if self._swappable_optimizer_subgroup(next_sub_group_id):
+                next_groups.append(self.fp32_partitioned_groups_flat[next_sub_group_id])
+                if len(next_groups) == prefetch_depth:
+                    break
+        return next_groups
 
     @instrument_w_nvtx
     def _release_sub_group(self, sub_group_id, timer_names):
@@ -2131,6 +2262,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         assert self._swappable_optimizer_subgroup(sub_group_id), \
             f'Parameter {fp32_param_id} of numel={param_length} is not swappable'
 
+        print_superrl_optimizer_debug(
+            f"swap_out_begin sub_group={sub_group_id} fp32_param_id={fp32_param_id} numel={param_length}")
         see_memory_usage(f'post-step Before swapping out optimizer tensors {sub_group_id}', force=False)
         if timer_names is not None:
             timer_names.add(OPTIMIZER_SWAP_OUT_STATE_TIMER)
@@ -2138,11 +2271,13 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         self.optimizer_swapper.swap_out_optimizer_state(
             parameter=self.fp32_partitioned_groups_flat[sub_group_id],
-            async_swap=self.next_swappable_fp32_partitioned_groups[sub_group_id] is not None)
+            async_swap=False if self._superrl_low_host_mem_disables_optimizer_pipeline() else
+            self.next_swappable_fp32_partitioned_groups[sub_group_id] is not None)
 
         if timer_names is not None:
             self.timers(OPTIMIZER_SWAP_OUT_STATE_TIMER).stop()
         see_memory_usage(f'post-step After swapping out optimizer tensors {sub_group_id}', force=False)
+        print_superrl_optimizer_debug(f"swap_out_end sub_group={sub_group_id}")
 
         # get rid of the fp32 gradients. Not needed anymore
         self.fp32_partitioned_groups_flat[sub_group_id].grad = None
@@ -2376,14 +2511,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     def has_overflow(self, partition_gradients=True):
         if partition_gradients:
             with get_accelerator().stream(self.reduce_and_partition_stream):
-                if hasattr(self.inf_or_nan_tracker, "logical_or_"):
-                    self.inf_or_nan_tracker.logical_or_(torch.isinf(self.grad_partitions_flat_buffer).any())
-                    self.inf_or_nan_tracker.logical_or_(torch.isnan(self.grad_partitions_flat_buffer).any())
-                else:
-                    # logical_or_ not available in older versions of pytorch
-                    self.inf_or_nan_tracker += torch.isinf(self.grad_partitions_flat_buffer).any()
-                    self.inf_or_nan_tracker += torch.isnan(self.grad_partitions_flat_buffer).any()
-                    self.inf_or_nan_tracker = self.inf_or_nan_tracker > 0
+                if not self._using_superrl_low_host_mem_grad_partitions():
+                    if hasattr(self.inf_or_nan_tracker, "logical_or_"):
+                        self.inf_or_nan_tracker.logical_or_(torch.isinf(self.grad_partitions_flat_buffer).any())
+                        self.inf_or_nan_tracker.logical_or_(torch.isnan(self.grad_partitions_flat_buffer).any())
+                    else:
+                        # logical_or_ not available in older versions of pytorch
+                        self.inf_or_nan_tracker += torch.isinf(self.grad_partitions_flat_buffer).any()
+                        self.inf_or_nan_tracker += torch.isnan(self.grad_partitions_flat_buffer).any()
+                        self.inf_or_nan_tracker = self.inf_or_nan_tracker > 0
 
                 overflow_gpu = self.inf_or_nan_tracker.clone().to(get_accelerator().current_device_name()).to(
                     torch.uint8)
@@ -3155,6 +3291,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         # LP grad
         if needs_offload(OffloadStateTypeEnum.lp_grads):
+            if self._using_superrl_low_host_mem_grad_partitions():
+                raise RuntimeError("offload_states(lp_grads) is not supported with superrl_low_host_mem enabled")
             if pin_memory:
                 if not hasattr(self, "lp_grad_partitions_flat_pin_buffers"):
                     self.lp_grad_partitions_flat_pin_buffers = get_accelerator().pin_memory(
@@ -3215,6 +3353,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         # LP grad
         if OffloadStateTypeEnum.lp_grads in self.offloaded_states:
+            if self._using_superrl_low_host_mem_grad_partitions():
+                raise RuntimeError("reload_states(lp_grads) is not supported with superrl_low_host_mem enabled")
             if hasattr(self, "lp_grad_partitions_flat_pin_buffers"):
                 self.grad_partitions_flat_buffer.data = self.lp_grad_partitions_flat_pin_buffers.to(
                     device, non_blocking=non_blocking)

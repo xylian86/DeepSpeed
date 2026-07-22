@@ -81,7 +81,7 @@ def get_state_devices(model, state: OffloadStateTypeEnum) -> Set[torch.device]:
     elif state == OffloadStateTypeEnum.lp_params:
         return set(p.ds_tensor.device for p in model.parameters())
     elif state == OffloadStateTypeEnum.lp_grads:
-        return {model.optimizer.grad_partitions_flat_buffer.device}
+        return model.optimizer.get_lp_grad_partition_devices()
     elif state == OffloadStateTypeEnum.optim_states:
         return set(model.optimizer.get_hp_param_device(p, "exp_avg") for p in model.parameters()) | \
                set(model.optimizer.get_hp_param_device(p, "exp_avg_sq") for p in model.parameters())
