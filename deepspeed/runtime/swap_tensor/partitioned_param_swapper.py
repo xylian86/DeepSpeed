@@ -12,10 +12,9 @@ from enum import Enum
 import torch
 from deepspeed import comm as dist
 from deepspeed.accelerator import get_accelerator
-from deepspeed.ops.op_builder import AsyncIOBuilder
-from deepspeed.ops.op_builder import GDSBuilder
 from .constants import *
-from .utils import swap_in_tensors, swap_out_tensors, MIN_AIO_BYTES, AIO_ALIGNED_BYTES, print_object, SwapBufferPool
+from .utils import swap_in_tensors, swap_out_tensors, MIN_AIO_BYTES, AIO_ALIGNED_BYTES, print_object, SwapBufferPool, \
+    get_swap_io_handle_factory
 from .lookahead_dram_cache import LookaheadDRAMCache
 from deepspeed.runtime.zero.offload_config import resolve_nvme_path
 
@@ -67,6 +66,7 @@ class AsyncPartitionedParameterSwapper(object):
 
         #keep track of available params
         self.available_params = set()
+        self.available_param_objects = {}
         self.available_numel = 0
 
         # for swapping out from partitioned fp32 params
@@ -98,8 +98,7 @@ class AsyncPartitionedParameterSwapper(object):
         self.aio_config = ds_config.aio_config
 
         self.use_gds = self.aio_config[AIO_USE_GDS]
-        self.aio_handle = GDSBuilder().load(verbose=False).gds_handle if self.use_gds else AsyncIOBuilder().load(
-            verbose=False).aio_handle
+        self.aio_handle = get_swap_io_handle_factory(self.aio_config, use_gds=self.use_gds, verbose=False)
 
         # Read/Write alignment for each thread during Intra-request parallelism
         self.min_aio_bytes = max(MIN_AIO_BYTES, self.aio_config[AIO_BLOCK_SIZE])
@@ -144,12 +143,12 @@ class AsyncPartitionedParameterSwapper(object):
         if not getattr(cache_config, "enabled", False):
             return None
 
-        aio_op = AsyncIOBuilder().load(verbose=False)
-        aio_read_handle = aio_op.aio_handle(block_size=self.aio_config[AIO_BLOCK_SIZE],
-                                            queue_depth=self.aio_config[AIO_QUEUE_DEPTH],
-                                            single_submit=self.aio_config[AIO_SINGLE_SUBMIT],
-                                            overlap_events=self.aio_config[AIO_OVERLAP_EVENTS],
-                                            intra_op_parallelism=self.aio_config[AIO_INTRA_OP_PARALLELISM])
+        aio_handle_factory = get_swap_io_handle_factory(self.aio_config, use_gds=False, verbose=False)
+        aio_read_handle = aio_handle_factory(block_size=self.aio_config[AIO_BLOCK_SIZE],
+                                             queue_depth=self.aio_config[AIO_QUEUE_DEPTH],
+                                             single_submit=self.aio_config[AIO_SINGLE_SUBMIT],
+                                             overlap_events=self.aio_config[AIO_OVERLAP_EVENTS],
+                                             intra_op_parallelism=self.aio_config[AIO_INTRA_OP_PARALLELISM])
         cache = LookaheadDRAMCache(enabled=True,
                                    dtype=self.dtype,
                                    aio_handle=aio_read_handle,
@@ -184,6 +183,8 @@ class AsyncPartitionedParameterSwapper(object):
             self.lookahead_cache.invalidate(params)
 
     def _mark_params_available(self, params, numel=None):
+        if not hasattr(self, "available_param_objects"):
+            self.available_param_objects = {}
         if numel is None:
             numel = sum(self.param_id_to_numel[param.ds_id] for param in params)
         newly_available = []
@@ -191,17 +192,48 @@ class AsyncPartitionedParameterSwapper(object):
             if param.ds_id not in self.available_params:
                 self.available_params.add(param.ds_id)
                 newly_available.append(param)
+            self.available_param_objects[param.ds_id] = param
         if len(newly_available) == len(params):
             self.available_numel += numel
         else:
             self.available_numel += sum(self.param_id_to_numel[param.ds_id] for param in newly_available)
 
     def _mark_params_not_available(self, params):
+        if not hasattr(self, "available_param_objects"):
+            self.available_param_objects = {}
         for param in params:
             param_id = param.ds_id
             if param_id in self.available_params:
                 self.available_params.remove(param_id)
                 self.available_numel -= self.param_id_to_numel[param_id]
+            self.available_param_objects.pop(param_id, None)
+
+    def release_available_parameters(self, count, exclude_param_ids=None):
+        if count <= 0:
+            return 0
+        if exclude_param_ids is None:
+            exclude_param_ids = set()
+        else:
+            exclude_param_ids = set(exclude_param_ids)
+        if not hasattr(self, "available_param_objects"):
+            self.available_param_objects = {}
+
+        released = 0
+        for param_id in list(self.available_params):
+            if param_id in exclude_param_ids:
+                continue
+            param = self.available_param_objects.get(param_id)
+            if param is None:
+                continue
+            active_sub_modules = getattr(param, "ds_active_sub_modules", None)
+            if active_sub_modules:
+                continue
+
+            self.remove_partition_and_release_buffers([param])
+            released += 1
+            if released >= count:
+                break
+        return released
 
     def _swap_in_from_cache(self, params):
         if not self.cache_enabled():
@@ -376,6 +408,17 @@ class AsyncPartitionedParameterSwapper(object):
 
     #assigns an in memory buffer and swaps in from nvme
     def swap_in(self, params, async_op=True, swap_in_buffers=None):
+        if swap_in_buffers is None:
+            deduped_params = []
+            seen_param_ids = set()
+            for param in params:
+                if param.ds_id in seen_param_ids:
+                    continue
+                seen_param_ids.add(param.ds_id)
+                deduped_params.append(param)
+            params = deduped_params
+            if not params:
+                return
 
         assert all([param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE
                     for param in params]), "Some params are already available or in flight"
@@ -387,6 +430,10 @@ class AsyncPartitionedParameterSwapper(object):
         swap_in_paths = self._get_swap_paths(params)
 
         if swap_in_buffers is None:
+            if len(self.available_buffer_ids) < len(swap_in_paths):
+                needed_buffers = len(swap_in_paths) - len(self.available_buffer_ids)
+                self.release_available_parameters(needed_buffers, exclude_param_ids=[p.ds_id for p in params])
+
             if len(self.available_buffer_ids) < len(swap_in_paths):
                 ids = [p.ds_id for p in params]
                 print_rank_0(

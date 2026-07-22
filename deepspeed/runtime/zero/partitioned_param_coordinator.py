@@ -583,15 +583,21 @@ class PartitionedParameterCoordinator:
 
         numel_considered = 0
         swap_in_params = []
+        swap_in_param_ids = set()
+        # Keep one swap-in buffer free for the synchronous demand fetch path. NVMe
+        # lookahead prefetch is opportunistic; consuming every buffer can deadlock
+        # the next required param behind prefetched future params.
+        prefetch_buffer_reserve = 1
         for param_in_trace in self.__param_queue:
             param = param_in_trace.param
             if param.nvme_swapper is None:
                 continue
-            if (numel_considered > 2 * numel_in_flight
-                    or len(swap_in_params) >= param.nvme_swapper.available_swap_in_buffers()):
+            max_prefetch_params = max(0, param.nvme_swapper.available_swap_in_buffers() - prefetch_buffer_reserve)
+            if (numel_considered > 2 * numel_in_flight or len(swap_in_params) >= max_prefetch_params):
                 break
-            if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE:
+            if param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE and param.ds_id not in swap_in_param_ids:
                 swap_in_params.append(param)
+                swap_in_param_ids.add(param.ds_id)
             numel_considered += param.ds_numel
 
         if swap_in_params:

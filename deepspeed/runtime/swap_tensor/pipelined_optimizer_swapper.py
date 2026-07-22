@@ -8,13 +8,12 @@ Functionality of swapping optimizer tensors to/from (NVMe) storage devices.
 
 import os
 
-from deepspeed.ops.op_builder import AsyncIOBuilder
-from deepspeed.ops.op_builder import GDSBuilder
 from deepspeed import comm as dist
 import torch
 
 from deepspeed.runtime.swap_tensor.constants import *
-from deepspeed.runtime.swap_tensor.utils import swap_in_tensors, swap_out_tensors, print_object, print_rank_0
+from deepspeed.runtime.swap_tensor.utils import swap_in_tensors, swap_out_tensors, print_object, print_rank_0, \
+    SwapBufferManager, get_swap_io_handle_factory
 from deepspeed.runtime.swap_tensor.async_swapper import AsyncTensorSwapper
 from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerSwapper
 from deepspeed.accelerator import get_accelerator
@@ -82,18 +81,19 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
         super(PipelinedOptimizerSwapper, self).__init__(swap_config, aio_config, base_folder, optimizer, largest_numel,
                                                         device, dtype, timers)
 
-        aio_op = AsyncIOBuilder().load()
-        self.write_aio_handle = aio_op.aio_handle(block_size=aio_config[AIO_BLOCK_SIZE],
+        aio_handle_factory = get_swap_io_handle_factory(aio_config)
+        self.write_aio_handle = aio_handle_factory(block_size=aio_config[AIO_BLOCK_SIZE],
+                                                   queue_depth=aio_config[AIO_QUEUE_DEPTH],
+                                                   single_submit=aio_config[AIO_SINGLE_SUBMIT],
+                                                   overlap_events=aio_config[AIO_OVERLAP_EVENTS],
+                                                   intra_op_parallelism=aio_config[AIO_INTRA_OP_PARALLELISM])
+
+        self.read_aio_handle = aio_handle_factory(block_size=aio_config[AIO_BLOCK_SIZE],
                                                   queue_depth=aio_config[AIO_QUEUE_DEPTH],
                                                   single_submit=aio_config[AIO_SINGLE_SUBMIT],
                                                   overlap_events=aio_config[AIO_OVERLAP_EVENTS],
                                                   intra_op_parallelism=aio_config[AIO_INTRA_OP_PARALLELISM])
-
-        self.read_aio_handle = aio_op.aio_handle(block_size=aio_config[AIO_BLOCK_SIZE],
-                                                 queue_depth=aio_config[AIO_QUEUE_DEPTH],
-                                                 single_submit=aio_config[AIO_SINGLE_SUBMIT],
-                                                 overlap_events=aio_config[AIO_OVERLAP_EVENTS],
-                                                 intra_op_parallelism=aio_config[AIO_INTRA_OP_PARALLELISM])
+        self.read_aio_handles = [self.read_aio_handle]
 
         # Overlap gradient swap out
         self.gradient_swapper = AsyncTensorSwapper(aio_handle=self.write_aio_handle,
@@ -103,7 +103,7 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
         self.async_swap_in = swap_config.pipeline_read
         self.async_swap_out = swap_config.pipeline_write
 
-        self.swap_ops = {SYNC_SWAP_IN: None, ASYNC_SWAP_IN: None, SYNC_SWAP_OUT: None, ASYNC_SWAP_OUT: None}
+        self.swap_ops = {SYNC_SWAP_IN: None, ASYNC_SWAP_IN: [], SYNC_SWAP_OUT: None, ASYNC_SWAP_OUT: None}
         self.pipeline_occupancy_events = 0
         self.pipeline_occupancy_log_enabled = os.environ.get(PIPELINE_OCCUPANCY_LOG_ENV, '').lower() in [
             '1', 'true', 'yes', 'on'
@@ -139,25 +139,62 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
 
         self._start_timer(SWAP_IN_STATE_TIMER)
 
-        if self.swap_ops[ASYNC_SWAP_IN]:
-            assert self.swap_ops[ASYNC_SWAP_IN].is_parameter(parameter)
-            self.swap_ops[SYNC_SWAP_IN] = self.swap_ops[ASYNC_SWAP_IN]
-            self.swap_ops[ASYNC_SWAP_IN] = None
+        async_swap_in_queue = self._async_swap_in_queue()
+        if async_swap_in_queue:
+            assert async_swap_in_queue[0].is_parameter(parameter)
+            self.swap_ops[SYNC_SWAP_IN] = async_swap_in_queue.pop(0)
         else:
-            self.swap_ops[SYNC_SWAP_IN] = self._swap_in_optimizer_state(aio_handle=self.read_aio_handle,
-                                                                        parameter=parameter)
+            self.swap_ops[SYNC_SWAP_IN] = self._swap_in_optimizer_state(
+                aio_handle=self._next_available_read_aio_handle(async_swap_in_queue), parameter=parameter)
 
         if self.swap_ops[SYNC_SWAP_IN]:
             self.swap_ops[SYNC_SWAP_IN].wait()
 
-        if self.async_swap_in and async_parameter is not None:
-            assert self.swap_ops[ASYNC_SWAP_IN] is None
-            self.swap_ops[ASYNC_SWAP_IN] = self._swap_in_optimizer_state(aio_handle=self.read_aio_handle,
-                                                                         parameter=async_parameter)
+        if self.async_swap_in:
+            queued_param_ids = {op.param_info.param_id for op in async_swap_in_queue}
+            current_param_id = OptimizerSwapper.parameter_id(parameter)
+            for candidate in self._normalize_async_parameters(async_parameter):
+                candidate_id = OptimizerSwapper.parameter_id(candidate)
+                if candidate_id == current_param_id or candidate_id in queued_param_ids:
+                    continue
+                read_aio_handle = self._next_available_read_aio_handle(async_swap_in_queue)
+                if read_aio_handle is None:
+                    break
+                prefetch_op = self._swap_in_optimizer_state(aio_handle=read_aio_handle,
+                                                            parameter=candidate,
+                                                            allow_buffer_miss=True)
+                if prefetch_op is None:
+                    break
+                async_swap_in_queue.append(prefetch_op)
+                queued_param_ids.add(candidate_id)
 
         self._stop_timer(SWAP_IN_STATE_TIMER)
         self.timer_names.add(SWAP_IN_STATE_TIMER)
         self._log_pipeline_occupancy('after swap_in_optimizer_state')
+
+    def _async_swap_in_queue(self):
+        queue = self.swap_ops[ASYNC_SWAP_IN]
+        if queue is None:
+            queue = []
+        elif not isinstance(queue, list):
+            queue = [queue]
+        self.swap_ops[ASYNC_SWAP_IN] = queue
+        return queue
+
+    def _normalize_async_parameters(self, async_parameter):
+        if async_parameter is None:
+            return []
+        if isinstance(async_parameter, (list, tuple)):
+            return [parameter for parameter in async_parameter if parameter is not None]
+        return [async_parameter]
+
+    def _next_available_read_aio_handle(self, async_swap_in_queue):
+        read_aio_handles = getattr(self, 'read_aio_handles', [self.read_aio_handle])
+        pending_handle_ids = {id(op.aio_handle) for op in async_swap_in_queue if op.wait_required}
+        for read_aio_handle in read_aio_handles:
+            if id(read_aio_handle) not in pending_handle_ids:
+                return read_aio_handle
+        return None
 
     def swap_out_optimizer_state(self, parameter, async_swap):
         self._start_timer(SWAP_OUT_STATE_TIMER)
@@ -204,11 +241,18 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
     def _pipeline_slot_occupancy(self, swap_op):
         if swap_op is None:
             return None
+        if isinstance(swap_op, list):
+            return [self._pipeline_slot_occupancy(op) for op in swap_op]
         return swap_op.occupancy()
 
     def _pipeline_occupancy(self):
         slots = {name: self._pipeline_slot_occupancy(op) for name, op in self.swap_ops.items()}
-        active_slots = [slot for slot in slots.values() if slot is not None]
+        active_slots = []
+        for slot in slots.values():
+            if isinstance(slot, list):
+                active_slots += [entry for entry in slot if entry is not None]
+            elif slot is not None:
+                active_slots.append(slot)
         return {
             'slots': slots,
             'active_slot_count': len(active_slots),
@@ -222,6 +266,10 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
     def _format_pipeline_slot_occupancy(self, name, slot):
         if slot is None:
             return f'{name}=None'
+        if isinstance(slot, list):
+            formatted = [self._format_pipeline_slot_occupancy(f'{name}[{index}]', entry)
+                         for index, entry in enumerate(slot)]
+            return f'{name}=[]' if not formatted else " | ".join(formatted)
         return (
             f"{name}({slot['kind']},param={slot['param_id']},wait={slot['wait_required']},"
             f"leases={slot['lease_count']},lease_buffers={slot['lease_buffer_count']},"
@@ -312,7 +360,7 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
 
         return swap_out_op
 
-    def _swap_in_optimizer_state(self, aio_handle, parameter):
+    def _swap_in_optimizer_state(self, aio_handle, parameter, allow_buffer_miss=False):
         param_info = self._get_param_swap_info(parameter)
         if param_info is None:
             return None
@@ -325,6 +373,8 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
                                                         dtype=parameter.dtype,
                                                         owner='pipelined optimizer swap-in')
         if lease is None:
+            if allow_buffer_miss:
+                return None
             raise RuntimeError(
                 self.swap_buffer_manager.allocation_failure_message(
                     requested_num_elems=aligned_numel,
@@ -369,18 +419,40 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
 class SuperRLPipelinedGDSOptimizerSwapper(PipelinedOptimizerSwapper):
 
     def __init__(self, swap_config, aio_config, base_folder, optimizer, largest_numel, device, dtype, timers):
+        read_parallelism = self._gds_parallelism(swap_config, aio_config, 'gds_read_intra_op_parallelism')
+        write_parallelism = self._gds_parallelism(swap_config, aio_config, 'gds_write_intra_op_parallelism')
+        prefetch_depth = max(1, int(getattr(swap_config, 'gds_prefetch_depth', 1)))
+
         gds_op = GDSBuilder().load(verbose=False)
+        # cuFile driver configuration is process-global and initialized by the
+        # first GDS handle. Keep that global cuFile setting write-friendly;
+        # the read handle below still owns its larger worker pool.
         self.write_aio_handle = gds_op.gds_handle(block_size=aio_config[AIO_BLOCK_SIZE],
                                                   queue_depth=aio_config[AIO_QUEUE_DEPTH],
                                                   single_submit=aio_config[AIO_SINGLE_SUBMIT],
                                                   overlap_events=aio_config[AIO_OVERLAP_EVENTS],
-                                                  intra_op_parallelism=aio_config[AIO_INTRA_OP_PARALLELISM])
+                                                  intra_op_parallelism=write_parallelism)
 
         self.read_aio_handle = gds_op.gds_handle(block_size=aio_config[AIO_BLOCK_SIZE],
                                                  queue_depth=aio_config[AIO_QUEUE_DEPTH],
                                                  single_submit=aio_config[AIO_SINGLE_SUBMIT],
                                                  overlap_events=aio_config[AIO_OVERLAP_EVENTS],
-                                                 intra_op_parallelism=aio_config[AIO_INTRA_OP_PARALLELISM])
+                                                 intra_op_parallelism=read_parallelism)
+        self.read_aio_handles = [self.read_aio_handle]
+        for _ in range(1, prefetch_depth):
+            self.read_aio_handles.append(
+                gds_op.gds_handle(block_size=aio_config[AIO_BLOCK_SIZE],
+                                  queue_depth=aio_config[AIO_QUEUE_DEPTH],
+                                  single_submit=aio_config[AIO_SINGLE_SUBMIT],
+                                  overlap_events=aio_config[AIO_OVERLAP_EVENTS],
+                                  intra_op_parallelism=read_parallelism))
+
+        aio_op = AsyncIOBuilder().load(verbose=False)
+        self.init_write_aio_handle = aio_op.aio_handle(block_size=aio_config[AIO_BLOCK_SIZE],
+                                                       queue_depth=aio_config[AIO_QUEUE_DEPTH],
+                                                       single_submit=aio_config[AIO_SINGLE_SUBMIT],
+                                                       overlap_events=aio_config[AIO_OVERLAP_EVENTS],
+                                                       intra_op_parallelism=write_parallelism)
 
         OptimizerSwapper.__init__(self,
                                   swap_config=swap_config,
@@ -393,28 +465,60 @@ class SuperRLPipelinedGDSOptimizerSwapper(PipelinedOptimizerSwapper):
                                   timers=timers,
                                   buffer_device=get_accelerator().current_device_name(),
                                   pin_memory_fn=self._pin_device_buffer,
-                                  unpin_memory_fn=self._unpin_device_buffer)
+                                  unpin_memory_fn=self._unpin_device_buffer,
+                                  lazy_swap_buffers=False)
+
+        # Initialization often starts from CPU fp16 partitions. Keep that path
+        # on host AIO staging; runtime optimizer state I/O below still uses GDS.
+        self.init_staging_swap_buffer_manager = SwapBufferManager(num_elems=self.staging_swap_buffer_manager.num_elems,
+                                                                  count=self.staging_swap_buffer_manager.count,
+                                                                  dtype=dtype,
+                                                                  name='optimizer_init_staging',
+                                                                  device='cpu')
 
         self.gradient_swapper = AsyncTensorSwapper(aio_handle=self.write_aio_handle,
                                                    numel_alignment=self.numel_alignment,
                                                    timers=self.timers)
 
-        self.async_swap_in = True
-        self.async_swap_out = True
+        self.async_swap_in = swap_config.pipeline_read
+        self.async_swap_out = swap_config.pipeline_write
 
-        self.swap_ops = {SYNC_SWAP_IN: None, ASYNC_SWAP_IN: None, SYNC_SWAP_OUT: None, ASYNC_SWAP_OUT: None}
+        self.swap_ops = {SYNC_SWAP_IN: None, ASYNC_SWAP_IN: [], SYNC_SWAP_OUT: None, ASYNC_SWAP_OUT: None}
         self.pipeline_occupancy_events = 0
         self.pipeline_occupancy_log_enabled = os.environ.get(PIPELINE_OCCUPANCY_LOG_ENV, '').lower() in [
             '1', 'true', 'yes', 'on'
         ]
 
         self.print_exclude_list += [
-            'gradient_swapper', 'read_aio_handle', 'write_aio_handle', 'swap_ops', 'pipeline_occupancy_events',
+            'gradient_swapper', 'read_aio_handle', 'write_aio_handle', 'init_write_aio_handle',
+            'init_staging_swap_buffer_manager', 'swap_ops', 'pipeline_occupancy_events',
             'pipeline_occupancy_log_enabled', 'print_exclude_list'
         ]
 
         if dist.get_rank() == 0:
             print_object(obj=self, name='SuperRLPipelinedGDSOptimizerSwapper', exclude_list=self.print_exclude_list)
+
+    def _with_init_staging(self, callback):
+        original_staging_manager = self.staging_swap_buffer_manager
+        self.staging_swap_buffer_manager = self.init_staging_swap_buffer_manager
+        try:
+            return callback()
+        finally:
+            self.staging_swap_buffer_manager = original_staging_manager
+
+    def initialize_parameters(self, parameters, src_tensors):
+        return self._with_init_staging(lambda: self._initialize_parameters(parameters=parameters,
+                                                                          src_tensors=src_tensors,
+                                                                          aio_handle=self.init_write_aio_handle))
+
+    def initialize_from_swapped_fp16_params(self, fp16_partitions_info, fp16_num_elems, fp16_pinned_buffers,
+                                            fp32_parameters):
+        return self._with_init_staging(
+            lambda: self._initialize_from_swapped_fp16_params(aio_handle=self.init_write_aio_handle,
+                                                             fp16_partitions_info=fp16_partitions_info,
+                                                             fp16_num_elems=fp16_num_elems,
+                                                             fp16_pinned_buffers=fp16_pinned_buffers,
+                                                             fp32_parameters=fp32_parameters))
 
     def _pin_device_buffer(self, buffer):
         self.read_aio_handle.pin_device_tensor(buffer)
@@ -422,3 +526,10 @@ class SuperRLPipelinedGDSOptimizerSwapper(PipelinedOptimizerSwapper):
 
     def _unpin_device_buffer(self, buffer):
         self.read_aio_handle.unpin_device_tensor(buffer)
+
+    @staticmethod
+    def _gds_parallelism(swap_config, aio_config, attr_name):
+        value = getattr(swap_config, attr_name, None)
+        if value is None:
+            value = aio_config[AIO_INTRA_OP_PARALLELISM]
+        return max(1, int(value))

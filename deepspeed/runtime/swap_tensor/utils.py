@@ -7,12 +7,14 @@ Functionality of swapping tensors to/from (NVMe) storage devices.
 """
 
 import time
+import os
 
 import torch
 from deepspeed.utils.logging import logger
 from deepspeed.accelerator import get_accelerator
 
 from deepspeed import comm as dist
+from deepspeed.runtime.swap_tensor.constants import AIO_IO_BACKEND, AIO_IO_BACKEND_ASYNC, AIO_IO_BACKEND_POSIX
 
 MIN_AIO_BYTES = 1024**2
 AIO_ALIGNED_BYTES = 1024
@@ -22,6 +24,88 @@ MIN_SWAPPABLE_BYTES = MIN_AIO_BYTES
 def _buffer_nbytes(buffer):
     nbytes = buffer.nbytes
     return nbytes() if callable(nbytes) else nbytes
+
+
+def _tensor_byte_memoryview(tensor):
+    if tensor.is_cuda:
+        raise RuntimeError("The POSIX swap I/O backend only supports CPU tensors.")
+    if not tensor.is_contiguous():
+        raise RuntimeError("The POSIX swap I/O backend requires contiguous tensors.")
+    byte_tensor = tensor.detach().view(torch.uint8)
+    return memoryview(byte_tensor.numpy())
+
+
+class PosixIOHandle(object):
+    """Blocking POSIX preadv/pwritev handle with the DeepSpeed AIO handle API."""
+
+    def __init__(self, *args, **kwargs):
+        self.completed_ops = 0
+
+    def async_pread(self, buffer, path, offset):
+        self._pread_exact(path=path, view=_tensor_byte_memoryview(buffer), offset=offset)
+        self.completed_ops += 1
+        return 0
+
+    def async_pwrite(self, buffer, path, offset):
+        os.makedirs(os.path.dirname(os.fspath(path)), exist_ok=True)
+        self._pwrite_exact(path=path, view=_tensor_byte_memoryview(buffer), offset=offset)
+        self.completed_ops += 1
+        return 0
+
+    def wait(self):
+        completed_ops = self.completed_ops
+        self.completed_ops = 0
+        return completed_ops
+
+    @staticmethod
+    def _pread_exact(path, view, offset):
+        fd = os.open(os.fspath(path), os.O_RDONLY)
+        try:
+            total = 0
+            while total < len(view):
+                nbytes = os.preadv(fd, [view[total:]], offset + total)
+                if nbytes == 0:
+                    raise EOFError(f"Short read from {path}: got {total} of {len(view)} bytes")
+                total += nbytes
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _pwrite_exact(path, view, offset):
+        fd = os.open(os.fspath(path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            total = 0
+            while total < len(view):
+                nbytes = os.pwritev(fd, [view[total:]], offset + total)
+                if nbytes == 0:
+                    raise OSError(f"Short write to {path}: wrote {total} of {len(view)} bytes")
+                total += nbytes
+        finally:
+            os.close(fd)
+
+
+class PosixIOBuilder(object):
+
+    def load(self, verbose=True):
+        return self
+
+    def aio_handle(self, *args, **kwargs):
+        return PosixIOHandle(*args, **kwargs)
+
+
+def get_swap_io_handle_factory(aio_config, use_gds=False, verbose=True):
+    backend = aio_config.get(AIO_IO_BACKEND, AIO_IO_BACKEND_ASYNC)
+    if backend == AIO_IO_BACKEND_POSIX:
+        if use_gds:
+            raise ValueError("POSIX swap I/O backend cannot be used with GDS.")
+        return PosixIOBuilder().load(verbose=verbose).aio_handle
+
+    if backend != AIO_IO_BACKEND_ASYNC:
+        raise ValueError(f"Unsupported swap I/O backend: {backend}")
+
+    from deepspeed.ops.op_builder import AsyncIOBuilder, GDSBuilder
+    return GDSBuilder().load(verbose=verbose).gds_handle if use_gds else AsyncIOBuilder().load(
+        verbose=verbose).aio_handle
 
 
 def is_direct_io_buffer(buffer):

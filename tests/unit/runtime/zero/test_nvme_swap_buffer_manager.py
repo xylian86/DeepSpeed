@@ -10,6 +10,7 @@ import torch
 
 from deepspeed.runtime.swap_tensor import utils as swap_utils
 from deepspeed.runtime.swap_tensor import optimizer_utils as optimizer_swap_utils
+from deepspeed.runtime.swap_tensor import partitioned_param_swapper as param_swapper_module
 from deepspeed.runtime.swap_tensor.lookahead_dram_cache import LookaheadDRAMCache
 from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerStateSwapInfo, OptimizerSwapFileAllocator, \
     OptimizerSwapper, split_swap_buffer_counts
@@ -404,6 +405,84 @@ def test_partitioned_param_swapper_cache_hit_releases_accounting():
     assert swapper.available_params == set()
     assert swapper.available_numel == 0
     assert cache.detached_params == [7]
+
+
+def test_partitioned_param_swapper_deduplicates_swap_in_params(monkeypatch):
+    monkeypatch.setattr(param_swapper_module.dist, "get_rank", lambda: 1)
+
+    swapper = AsyncPartitionedParameterSwapper.__new__(AsyncPartitionedParameterSwapper)
+    swapper.lookahead_cache = None
+    swapper.param_id_to_numel = {7: 2}
+    swapper.param_id_to_buffer_id = {}
+    swapper.param_id_to_swap_buffer = {}
+    swapper.available_buffer_ids = [0]
+    swapper.aligned_elements_per_buffer = 2
+    swapper.buffers = torch.empty(2, dtype=torch.float32)
+    swapper.numel_alignment = 1
+    swapper.id_to_path = {7: "param-7.swp"}
+    swapper.aio_read_handle = _FakeAIOHandle()
+    swapper.pending_reads = 0
+    swapper.inflight_params = []
+    swapper.inflight_swap_in_buffers = []
+    swapper.inflight_numel = 0
+
+    param = SimpleNamespace(ds_id=7,
+                            ds_tensor=SimpleNamespace(ds_numel=2,
+                                                      status=PartitionedParamStatus.NOT_AVAILABLE,
+                                                      data=torch.empty(1, dtype=torch.float32).data))
+
+    swapper.swap_in([param, param], async_op=True)
+
+    assert param.ds_tensor.status == PartitionedParamStatus.INFLIGHT
+    assert swapper.available_buffer_ids == []
+    assert swapper.param_id_to_buffer_id == {7: 0}
+    assert len(swapper.aio_read_handle.reads) == 1
+    assert swapper.pending_reads == 1
+    assert swapper.inflight_params == [param]
+
+
+def test_partitioned_param_swapper_reclaims_available_buffer_for_demand_swap_in(monkeypatch):
+    monkeypatch.setattr(param_swapper_module.dist, "get_rank", lambda: 1)
+
+    swapper = AsyncPartitionedParameterSwapper.__new__(AsyncPartitionedParameterSwapper)
+    swapper.lookahead_cache = None
+    swapper.param_id_to_numel = {7: 2, 8: 2}
+    swapper.available_buffer_ids = []
+    swapper.aligned_elements_per_buffer = 2
+    swapper.buffers = torch.empty(2, dtype=torch.float32)
+    swapper.numel_alignment = 1
+    swapper.id_to_path = {7: "param-7.swp", 8: "param-8.swp"}
+    swapper.aio_read_handle = _FakeAIOHandle()
+    swapper.pending_reads = 0
+    swapper.inflight_params = []
+    swapper.inflight_swap_in_buffers = []
+    swapper.inflight_numel = 0
+    swapper.invalid_buffer = torch.empty(1, dtype=torch.float32)
+
+    old_param = SimpleNamespace(ds_id=7,
+                                ds_active_sub_modules=set(),
+                                ds_tensor=SimpleNamespace(ds_numel=2,
+                                                          status=PartitionedParamStatus.AVAILABLE,
+                                                          data=swapper.buffers.data))
+    new_param = SimpleNamespace(ds_id=8,
+                                ds_tensor=SimpleNamespace(ds_numel=2,
+                                                          status=PartitionedParamStatus.NOT_AVAILABLE,
+                                                          data=torch.empty(1, dtype=torch.float32).data))
+    swapper.param_id_to_buffer_id = {7: 0}
+    swapper.param_id_to_swap_buffer = {7: swapper.buffers}
+    swapper.available_params = {7}
+    swapper.available_param_objects = {7: old_param}
+    swapper.available_numel = 2
+
+    swapper.swap_in([new_param], async_op=True)
+
+    assert old_param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE
+    assert new_param.ds_tensor.status == PartitionedParamStatus.INFLIGHT
+    assert swapper.param_id_to_buffer_id == {8: 0}
+    assert swapper.available_params == set()
+    assert swapper.available_numel == 0
+    assert len(swapper.aio_read_handle.reads) == 1
+    assert swapper.pending_reads == 1
 
 
 def test_split_swap_buffer_counts_preserves_total_pipeline_budget():

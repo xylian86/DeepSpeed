@@ -233,7 +233,8 @@ class OptimizerSwapper(object):
                  timers,
                  buffer_device='cpu',
                  pin_memory_fn=None,
-                 unpin_memory_fn=None):
+                 unpin_memory_fn=None,
+                 lazy_swap_buffers=None):
         self.swap_config = swap_config
         self.aio_config = aio_config
 
@@ -258,6 +259,7 @@ class OptimizerSwapper(object):
         self.largest_numel = self._io_aligned_numel(largest_numel)
         self.dtype = dtype
         state_buffer_count, staging_buffer_count = split_swap_buffer_counts(swap_config)
+        lazy_state_buffers = staging_buffer_count > 0 if lazy_swap_buffers is None else bool(lazy_swap_buffers)
         self.staging_num_write_calls = 0
         self.staging_num_chunks_written = 0
         self.staging_num_elements_written = 0
@@ -265,7 +267,7 @@ class OptimizerSwapper(object):
                                                      count=state_buffer_count,
                                                      dtype=dtype,
                                                      name='optimizer_state',
-                                                     lazy=staging_buffer_count > 0,
+                                                     lazy=lazy_state_buffers,
                                                      device=buffer_device,
                                                      pin_memory_fn=pin_memory_fn,
                                                      unpin_memory_fn=unpin_memory_fn)
