@@ -9,6 +9,8 @@
 
 #include "deepspeed_py_gds_handle.h"
 #include <cstdlib>
+#include <limits.h>
+#include <unistd.h>
 #include "deepspeed_gds_op.h"
 
 using namespace std;
@@ -20,7 +22,8 @@ deepspeed_gds_handle_t::deepspeed_gds_handle_t(const int block_size,
                                                const bool single_submit,
                                                const bool overlap_events,
                                                const int intra_op_parallelism)
-    : deepspeed_io_handle_t(block_size, queue_depth, single_submit, overlap_events, 1),
+    : deepspeed_io_handle_t(
+          block_size, queue_depth, single_submit, overlap_events, intra_op_parallelism),
       _intra_gds_op_parallelism(intra_op_parallelism)
 {
     _init_cuFile(block_size, queue_depth);
@@ -38,24 +41,32 @@ void deepspeed_gds_handle_t::_init_cuFile(const int block_size, const int queue_
     if (deepspeed_gds_handle_t::s_cuFile_init == 0) {
         std::string depthStr = std::to_string(queue_depth);
         std::string threadsStr = std::to_string(_intra_gds_op_parallelism);
+        const char* pinnedMemEnv = std::getenv("DEEPSPEED_GDS_MAX_DEVICE_PINNED_MEM_KB");
+        const char* cacheMemEnv = std::getenv("DEEPSPEED_GDS_MAX_DEVICE_CACHE_KB");
+        std::string pinnedMemKb = pinnedMemEnv != nullptr ? std::string(pinnedMemEnv) : "134217728";
+        std::string cacheMemKb = cacheMemEnv != nullptr ? std::string(cacheMemEnv) : "1048576";
         std::string json1 = R"({"execution": {"max_io_queue_depth": )" + depthStr + ", ";
         std::string json2 = R"("max_request_parallelism": )" + threadsStr + ", ";
         std::string json3 = R"("max_io_threads": )" + threadsStr + ", ";
-        std::string json4 = R"("parallel_io": true, "min_io_threshold_size_kb": 8192}})";
+        std::string json4 = R"("parallel_io": true, "min_io_threshold_size_kb": 8192}, )";
+        std::string json5 = R"("properties": {"max_device_cache_size_kb": )" + cacheMemKb + ", ";
+        std::string json6 = R"("per_buffer_cache_size_kb": 1024, "max_device_pinned_mem_size_kb": )" + pinnedMemKb + ", ";
+        std::string json7 = R"("allow_compat_mode": false, "use_poll_mode": false}})";
         std::ofstream outFile("local_cufile.json");
         if (outFile.is_open()) {
-            outFile << json1 + json2 + json3 + json4;
+            outFile << json1 + json2 + json3 + json4 + json5 + json6 + json7;
             outFile.close();
         } else {
             std::cerr << "Can't open local cufile" << std::endl;
             exit(EXIT_FAILURE);
         }
-        // TODO: Address the following issues with this code
-        // (1) Fix C++14 warning
-        // (2) Create file in a different location than PWD
-        // (3) Handle multi-GPU/multi-rank scenarios: should cufile be shared, is per-rank cufile
-        // safe?
-        putenv("CUFILE_ENV_PATH_JSON=$PWD/local_cufile.json");
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd)) == nullptr) {
+            std::cerr << "Can't resolve current directory for local cufile" << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        std::string configPath = std::string(cwd) + "/local_cufile.json";
+        setenv("CUFILE_ENV_PATH_JSON", configPath.c_str(), 1);
         cuFileDriverOpen();
         cudaCheckError();
         size_t direct_io_size = (size_t)block_size / 1024;
