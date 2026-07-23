@@ -959,19 +959,31 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                                               avoid_copy=not self.offload_param)
 
         # if necessary, create a pinned memory buffer to be used for swapping out
-        # params to NVME after optimizer step
+        # params to NVME after optimizer step. A PPO wrapper may contain
+        # submodules that were loaded under separate ZeRO-3 Init contexts, so
+        # reserve one reuse buffer per distinct parameter swapper.
         should_create_fp16_flat_reuse_buffer = any(flattened_partition_group is None
                                                    for flattened_partition_group in self.fp16_partitioned_groups_flat)
         if should_create_fp16_flat_reuse_buffer:
-            max_partition_numel, largest_partition_numel = 0, None
-            for sub_group in self.fp16_groups:
-                total_elements = sum(t.partition_numel() for t in sub_group)
-                if total_elements > max_partition_numel:
-                    largest_partition_numel = [t.ds_numel for t in sub_group]
-                    max_partition_numel = total_elements
+            largest_partition_numel_by_swapper = {}
+            max_partition_numel_by_swapper = {}
+            for sub_group, flattened_partition_group in zip(self.fp16_groups, self.fp16_partitioned_groups_flat):
+                if flattened_partition_group is not None:
+                    continue
 
-            assert len(largest_partition_numel) > 0, 'Unexpected that largest partition is empty'
-            self.fp16_groups[0][0].nvme_swapper.reserve_partitioned_swap_space(largest_partition_numel)
+                partitions_by_swapper = {}
+                for param in sub_group:
+                    partitions_by_swapper.setdefault(param.nvme_swapper, []).append(param.ds_numel)
+
+                for nvme_swapper, partition_numel in partitions_by_swapper.items():
+                    total_elements = sum(partition_numel)
+                    if total_elements > max_partition_numel_by_swapper.get(nvme_swapper, 0):
+                        largest_partition_numel_by_swapper[nvme_swapper] = partition_numel
+                        max_partition_numel_by_swapper[nvme_swapper] = total_elements
+
+            assert len(largest_partition_numel_by_swapper) > 0, 'Unexpected that largest partition is empty'
+            for nvme_swapper, largest_partition_numel in largest_partition_numel_by_swapper.items():
+                nvme_swapper.reserve_partitioned_swap_space(largest_partition_numel)
 
     def _get_parameter_partitions(self) -> List[Tensor]:
         return [param.ds_tensor for sub_group in self.fp16_groups for param in sub_group]
@@ -1228,8 +1240,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             offset += partitioned_param.ds_numel
 
         if len(swap_fp16_params):
-            swap_fp16_params[0].nvme_swapper.swap_out_partitioned_params(dst_fp16_params=swap_fp16_params,
-                                                                         src_fp32_params=swap_fp32_params)
+            params_by_swapper = collections.defaultdict(lambda: ([], []))
+            for fp16_param, fp32_param in zip(swap_fp16_params, swap_fp32_params):
+                grouped_fp16_params, grouped_fp32_params = params_by_swapper[fp16_param.nvme_swapper]
+                grouped_fp16_params.append(fp16_param)
+                grouped_fp32_params.append(fp32_param)
+
+            for nvme_swapper, (grouped_fp16_params, grouped_fp32_params) in params_by_swapper.items():
+                nvme_swapper.swap_out_partitioned_params(dst_fp16_params=grouped_fp16_params,
+                                                         src_fp32_params=grouped_fp32_params)
 
     def _set_fp16_partitioned_groups_flat(self):
         # setup flat buffers per subgroup, these are each just sections of the
