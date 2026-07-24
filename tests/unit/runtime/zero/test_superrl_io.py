@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from deepspeed.runtime.swap_tensor import pipelined_optimizer_swapper
 from deepspeed.runtime.swap_tensor.constants import AIO_BLOCK_SIZE, AIO_INTRA_OP_PARALLELISM, AIO_OVERLAP_EVENTS, \
     AIO_QUEUE_DEPTH, AIO_SINGLE_SUBMIT, AIO_THREAD_COUNT
 from deepspeed.runtime.swap_tensor.superrl_io import GDSProbeResult, ensure_superrl_io_gds_ready, \
@@ -37,6 +38,11 @@ def test_superrl_io_disabled_does_not_probe():
     ensure_superrl_io_gds_ready(SimpleNamespace(enabled=False), None, _aio_config(), probe_fn=probe_fn)
 
     assert called is False
+
+
+def test_superrl_gds_optimizer_builders_are_imported():
+    assert pipelined_optimizer_swapper.GDSBuilder is not None
+    assert pipelined_optimizer_swapper.AsyncIOBuilder is not None
 
 
 def test_superrl_io_requires_nvme_optimizer_offload():
@@ -114,6 +120,22 @@ def test_superrl_io_swap_config_enables_hidden_pipeline_defaults():
     assert config.gds_write_intra_op_parallelism == 2
 
 
+def test_superrl_io_swap_config_supports_synchronous_five_buffer_mode():
+    config = make_superrl_io_swap_config(
+        SimpleNamespace(buffer_count=4, buffer_size=12345, pipeline=False, pipeline_read=False, pipeline_write=False),
+        SimpleNamespace(pipeline_read=False,
+                        pipeline_write=False,
+                        prefetch_depth=4,
+                        read_thread_count=2,
+                        write_thread_count=2))
+
+    assert config.pipeline is False
+    assert config.pipeline_read is False
+    assert config.pipeline_write is False
+    assert config.buffer_count == 5
+    assert config.gds_prefetch_depth == 1
+
+
 def test_gds_probe_requires_cuda_accelerator(monkeypatch):
 
     class _FakeAccelerator:
@@ -161,11 +183,16 @@ def test_gds_probe_uses_current_cuda_device(monkeypatch, tmp_path):
     assert "torch.cuda.set_device(device_index)" in captured["cmd"][2]
 
 
-def _stage3_mode(superrl_io_enabled=True, low_host_mem_enabled=True, disable_superrl_io=True):
+def _stage3_mode(superrl_io_enabled=True,
+                 low_host_mem_enabled=True,
+                 disable_superrl_io=True,
+                 pipeline_read=True,
+                 pipeline_write=True):
     optimizer = DeepSpeedZeroOptimizer_Stage3.__new__(DeepSpeedZeroOptimizer_Stage3)
     optimizer.superrl_io_enabled = superrl_io_enabled
     optimizer.superrl_low_host_mem_enabled = low_host_mem_enabled
     optimizer.superrl_low_host_mem_config = SimpleNamespace(disable_superrl_io=disable_superrl_io)
+    optimizer.superrl_io_config = SimpleNamespace(pipeline_read=pipeline_read, pipeline_write=pipeline_write)
     optimizer.offload_optimizer = True
     return optimizer
 
@@ -179,8 +206,14 @@ def test_low_host_mem_disables_superrl_io_runtime():
 def test_low_host_mem_rejects_unsupported_superrl_io_override():
     optimizer = _stage3_mode(disable_superrl_io=False)
 
-    with pytest.raises(ValueError, match="cannot remain active"):
+    with pytest.raises(ValueError, match="supports SuperRL-IO only"):
         optimizer._resolve_superrl_io_active()
+
+
+def test_low_host_mem_allows_synchronous_superrl_io():
+    optimizer = _stage3_mode(disable_superrl_io=False, pipeline_read=False, pipeline_write=False)
+
+    assert optimizer._resolve_superrl_io_active() is True
 
 
 def test_low_host_mem_optimizer_step_uses_base_optimizer():

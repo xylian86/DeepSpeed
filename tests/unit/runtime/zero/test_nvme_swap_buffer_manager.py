@@ -217,6 +217,34 @@ def test_swap_buffer_manager_supports_custom_pin_hooks(monkeypatch):
     assert len(unpinned) == 1
 
 
+def test_swap_buffer_manager_releases_and_rehydrates_idle_pool(monkeypatch):
+    _patch_swap_buffer_manager_deps(monkeypatch)
+    pinned = []
+    unpinned = []
+
+    manager = swap_utils.SwapBufferManager(num_elems=8,
+                                           count=2,
+                                           dtype=torch.float32,
+                                           pin_memory_fn=lambda buffer: pinned.append(buffer) or buffer,
+                                           unpin_memory_fn=unpinned.append)
+    lease = manager.allocate_lease(num_elems=4, count=1, dtype=torch.float32, owner="active lease")
+    with pytest.raises(RuntimeError, match="leased buffer"):
+        manager.release_all_buffers()
+    lease.release()
+
+    released_bytes = manager.release_all_buffers()
+    assert released_bytes == 8 * 2 * torch.tensor([], dtype=torch.float32).element_size()
+    assert len(unpinned) == 2
+    assert manager.status()["total_bytes"] == 0
+    assert all(buffer is None for buffer in manager.all_buffers)
+
+    buffers = manager.allocate(num_elems=8, count=2, dtype=torch.float32)
+    assert buffers is not None
+    assert len(pinned) == 4
+    assert manager.status()["total_bytes"] == released_bytes
+    manager.free(buffers)
+
+
 def test_swap_buffer_manager_summary_reports_lifecycle_counters(monkeypatch):
     _patch_swap_buffer_manager_deps(monkeypatch)
 

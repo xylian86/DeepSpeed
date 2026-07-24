@@ -23,6 +23,7 @@ from deepspeed.runtime.swap_tensor.constants import AIO_BLOCK_SIZE, AIO_INTRA_OP
 from deepspeed.runtime.zero.offload_config import resolve_nvme_path
 
 SUPERRL_IO_MIN_OPTIMIZER_BUFFER_COUNT = 16
+SUPERRL_IO_SYNC_MIN_OPTIMIZER_BUFFER_COUNT = 5
 SUPERRL_IO_BUFFERS_PER_PREFETCH = 4
 
 
@@ -209,11 +210,12 @@ def ensure_superrl_io_gds_ready(superrl_io_config, offload_optimizer_config, aio
 
 
 def make_superrl_io_swap_config(swap_config, superrl_io_config=None):
-    """Return an internal optimizer swap config for the SuperRL-IO pipeline.
+    """Return an internal optimizer swap config for SuperRL-IO.
 
     The user-facing control remains ``superrl_io: true``. The hidden defaults
-    below make that switch imply read/write pipelining with enough buffer slots
-    for Adam state, configured read prefetches, previous-write, and staging.
+    below enable read/write pipelining by default. Explicitly disabling both
+    pipeline directions selects a synchronous five-buffer GDS path for
+    host-memory-constrained runs.
     """
     config = copy.copy(swap_config)
     pipeline_read = True if superrl_io_config is None else bool(getattr(superrl_io_config, "pipeline_read", True))
@@ -224,12 +226,17 @@ def make_superrl_io_swap_config(swap_config, superrl_io_config=None):
     read_thread_count = None if superrl_io_config is None else getattr(superrl_io_config, "read_thread_count", None)
     write_thread_count = None if superrl_io_config is None else getattr(superrl_io_config, "write_thread_count", None)
     prefetch_depth = 1 if superrl_io_config is None else max(1, int(getattr(superrl_io_config, "prefetch_depth", 1)))
+    if not config.pipeline:
+        prefetch_depth = 1
     config.__dict__["gds_prefetch_depth"] = prefetch_depth
     if read_thread_count is not None:
         config.__dict__["gds_read_intra_op_parallelism"] = int(read_thread_count)
     if write_thread_count is not None:
         config.__dict__["gds_write_intra_op_parallelism"] = int(write_thread_count)
-    min_buffer_count = SUPERRL_IO_MIN_OPTIMIZER_BUFFER_COUNT + \
-        (prefetch_depth - 1) * SUPERRL_IO_BUFFERS_PER_PREFETCH
+    if config.pipeline:
+        min_buffer_count = SUPERRL_IO_MIN_OPTIMIZER_BUFFER_COUNT + \
+            (prefetch_depth - 1) * SUPERRL_IO_BUFFERS_PER_PREFETCH
+    else:
+        min_buffer_count = SUPERRL_IO_SYNC_MIN_OPTIMIZER_BUFFER_COUNT
     config.__dict__["buffer_count"] = max(int(getattr(config, "buffer_count", 0)), min_buffer_count)
     return config

@@ -527,6 +527,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         print_rank_0("Removed grad acc hooks", force=False)
         self.ipg_buckets.clear()
 
+    def release_superrl_optimizer_buffers(self):
+        if not self.superrl_io_active or not hasattr(self.optimizer_swapper, "release_buffers_for_rollout"):
+            return 0
+        return self.optimizer_swapper.release_buffers_for_rollout()
+
     def create_zenflow_hooks(self):
         from functools import partial
         hook_names = [
@@ -736,11 +741,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if not low_host_mem:
             return True
 
-        if not getattr(self.superrl_low_host_mem_config, "disable_superrl_io", True):
-            raise ValueError("SuperRL-IO cannot remain active with superrl_low_host_mem. "
-                             "The current GDS optimizer swapper requires pipelining; set "
-                             "superrl_low_host_mem.disable_superrl_io=true or disable low-host mode.")
-        return False
+        if getattr(self.superrl_low_host_mem_config, "disable_superrl_io", True):
+            return False
+
+        pipeline_read = bool(getattr(self.superrl_io_config, "pipeline_read", True))
+        pipeline_write = bool(getattr(self.superrl_io_config, "pipeline_write", True))
+        if pipeline_read or pipeline_write:
+            raise ValueError("superrl_low_host_mem supports SuperRL-IO only when "
+                             "superrl_io.pipeline_read=false and superrl_io.pipeline_write=false")
+        return True
 
     def _configure_superrl_io_optimizer(self):
         if not self.offload_optimizer or not self.swap_optimizer:
@@ -798,12 +807,21 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         swap_config = offload_optimizer_config
         if low_host_mem:
             swap_config = self._make_superrl_low_host_mem_optimizer_swap_config(offload_optimizer_config)
-            swapper_type = PipelinedOptimizerSwapper if swap_config.pipeline else PartitionedOptimizerSwapper
+            if effective_superrl_io:
+                swap_config = make_superrl_io_swap_config(swap_config, self.superrl_io_config)
+                swapper_type = SuperRLPipelinedGDSOptimizerSwapper
+                swapper_optimizer = self.superrl_io_optimizer
+                if dist.get_rank() == 0:
+                    mode = "pipelined" if swap_config.pipeline else "synchronous"
+                    logger.info("SuperRL low_host_mem enabled: using "
+                                f"{mode} GDS optimizer swapper with {swap_config.buffer_count} buffers")
+            else:
+                swapper_type = PipelinedOptimizerSwapper if swap_config.pipeline else PartitionedOptimizerSwapper
             if disable_superrl_io_for_low_host and self.superrl_io_enabled:
                 if dist.get_rank() == 0:
                     logger.info(
                         "SuperRL low_host_mem enabled: using non-pipelined optimizer NVMe swapper and "
-                        "disabling SuperRL-IO because the current GDS optimizer swapper is pipelined.")
+                        "disabling SuperRL-IO by configuration.")
         elif effective_superrl_io:
             swapper_type = SuperRLPipelinedGDSOptimizerSwapper
             swap_config = make_superrl_io_swap_config(offload_optimizer_config, self.superrl_io_config)

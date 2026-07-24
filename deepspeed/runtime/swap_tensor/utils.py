@@ -568,6 +568,22 @@ class SwapBufferManager(object):
             del (self.used_buffer_index[b_id])
             del (self.used_buffer_numel[b_id])
 
+    def release_all_buffers(self):
+        """Unpin and release an idle pool while preserving its slot capacity."""
+        if self.used_buffer_index:
+            raise RuntimeError(
+                f"Cannot release SwapBufferManager[{self.name}] with {len(self.used_buffer_index)} leased buffer(s)")
+
+        released_bytes = self._pinned_bytes()
+        for index, buffer in enumerate(self.all_buffers):
+            if buffer is not None and self.unpin_memory_fn is not None:
+                self.unpin_memory_fn(buffer)
+            self.all_buffers[index] = None
+            self.buffer_numel[index] = 0
+        self.total_bytes = 0
+        self.gigabytes = 0
+        return released_bytes
+
     def status(self):
         self.total_bytes = self._pinned_bytes()
         self.gigabytes = self.total_bytes / (1024**3)

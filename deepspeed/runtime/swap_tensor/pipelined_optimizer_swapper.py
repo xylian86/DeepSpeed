@@ -15,8 +15,9 @@ from deepspeed.runtime.swap_tensor.constants import *
 from deepspeed.runtime.swap_tensor.utils import swap_in_tensors, swap_out_tensors, print_object, print_rank_0, \
     SwapBufferManager, get_swap_io_handle_factory
 from deepspeed.runtime.swap_tensor.async_swapper import AsyncTensorSwapper
-from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerSwapper
+from deepspeed.runtime.swap_tensor.optimizer_utils import OPTIMIZER_SWAP_STAGING_BUFFER_COUNT, OptimizerSwapper
 from deepspeed.accelerator import get_accelerator
+from deepspeed.ops.op_builder import AsyncIOBuilder, GDSBuilder
 
 
 class OptimizerSwapOp(object):
@@ -231,12 +232,28 @@ class PipelinedOptimizerSwapper(OptimizerSwapper):
 
     def _complete_swap_out(self, swap_out_type):
         self._log_pipeline_occupancy(f'before complete {swap_out_type}')
-        self.swap_ops[swap_out_type].wait()
-        for buffer in self.swap_ops[swap_out_type].state_buffers:
-            buffer = torch.Tensor()
-        self.swap_ops[swap_out_type].release_buffers()
+        swap_op = self.swap_ops[swap_out_type]
+        swap_op.wait()
+        swap_op.param_info.release_memory()
+        swap_op.release_buffers()
         self.swap_ops[swap_out_type] = None
         self._log_pipeline_occupancy(f'after complete {swap_out_type}')
+
+    def release_buffers_for_rollout(self):
+        """Release an idle runtime state pool at an update-to-rollout boundary."""
+        self._flush_gradient_swapper(self.gradient_swapper)
+        pending_ops = [self.swap_ops[SYNC_SWAP_IN], self.swap_ops[SYNC_SWAP_OUT], self.swap_ops[ASYNC_SWAP_OUT]]
+        pending_ops.extend(self._async_swap_in_queue())
+        if any(op is not None for op in pending_ops):
+            raise RuntimeError("Cannot release optimizer buffers while pipeline I/O is active")
+
+        for swap_info in self.swap_params_info.values():
+            swap_info.release_memory()
+            self._release_swap_info_buffers(swap_info)
+        released_bytes = self.swap_buffer_manager.release_all_buffers()
+        if self.staging_swap_buffer_manager is not self.swap_buffer_manager:
+            released_bytes += self.staging_swap_buffer_manager.release_all_buffers()
+        return released_bytes
 
     def _pipeline_slot_occupancy(self, swap_op):
         if swap_op is None:
@@ -470,8 +487,8 @@ class SuperRLPipelinedGDSOptimizerSwapper(PipelinedOptimizerSwapper):
 
         # Initialization often starts from CPU fp16 partitions. Keep that path
         # on host AIO staging; runtime optimizer state I/O below still uses GDS.
-        self.init_staging_swap_buffer_manager = SwapBufferManager(num_elems=self.staging_swap_buffer_manager.num_elems,
-                                                                  count=self.staging_swap_buffer_manager.count,
+        self.init_staging_swap_buffer_manager = SwapBufferManager(num_elems=self._staging_buffer_numel(swap_config),
+                                                                  count=OPTIMIZER_SWAP_STAGING_BUFFER_COUNT,
                                                                   dtype=dtype,
                                                                   name='optimizer_init_staging',
                                                                   device='cpu')

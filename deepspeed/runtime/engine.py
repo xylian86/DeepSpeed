@@ -4409,6 +4409,17 @@ class DeepSpeedEngine(Module):
             gc.collect()
             get_accelerator().empty_cache()
 
+    def release_superrl_optimizer_buffers(self):
+        """Release update-only SuperRL GDS buffers before a colocated rollout."""
+        release_fn = getattr(self.optimizer, 'release_superrl_optimizer_buffers', None)
+        if release_fn is None:
+            return 0
+        released_bytes = release_fn()
+        if released_bytes:
+            gc.collect()
+            get_accelerator().empty_cache()
+        return released_bytes
+
     def compile(self,
                 backend=get_accelerator().get_compile_backend(),
                 compile_kwargs={},
