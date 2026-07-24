@@ -111,7 +111,10 @@ class OptimizerStateSwapInfo(object):
 
     def bind_unbound_direct_swap_buffers(self, buffers, aligned_numel):
         contexts = [t for t in self.tensors if is_direct_io_buffer(t.compute_tensor) and t.swap_tensor.numel() == 0]
-        assert len(contexts) <= len(buffers)
+        if len(contexts) != len(buffers):
+            raise ValueError(f"Expected {len(contexts)} direct swap buffers, got {len(buffers)}")
+        if aligned_numel < self.numel():
+            raise ValueError(f"Aligned buffer size {aligned_numel} is smaller than tensor size {self.numel()}")
         compute_lengths = [self.numel()] * len(contexts)
         swap_lengths = [aligned_numel] * len(contexts)
         compute_buffers = get_sized_buffers(buffers, compute_lengths)

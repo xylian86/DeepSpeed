@@ -325,12 +325,13 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.inf_or_nan_tracker: Tensor = torch.zeros(1, dtype=torch.bool, device=self.device, requires_grad=False)
 
         self.deepspeed_adam_offload = (self.offload_optimizer and type(init_optimizer) == DeepSpeedCPUAdam)
-        self.superrl_io_config = superrl_io_config
-        self.superrl_io_enabled = getattr(superrl_io_config, "enabled", False)
-        self.superrl_io_optimizer = self._configure_superrl_io_optimizer() if self.superrl_io_enabled else None
         self.superrl_low_host_mem_config = superrl_low_host_mem_config
         self.superrl_low_host_mem_enabled = getattr(superrl_low_host_mem_config, "enabled", False)
         self.superrl_low_host_mem_grad_partitions = False
+        self.superrl_io_config = superrl_io_config
+        self.superrl_io_enabled = getattr(superrl_io_config, "enabled", False)
+        self.superrl_io_active = self._resolve_superrl_io_active()
+        self.superrl_io_optimizer = self._configure_superrl_io_optimizer() if self.superrl_io_active else None
 
         ### streams used for overlapping computation with communication
         self.reduce_and_partition_stream = None if get_accelerator().is_synchronized_device() else get_accelerator(
@@ -727,6 +728,20 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 f"FP16 params swapping is {self.params_in_nvme_and_cpu}, Max params in CPU is {self.max_params_in_cpu}",
                 force=False)
 
+    def _resolve_superrl_io_active(self):
+        if not self.superrl_io_enabled:
+            return False
+
+        low_host_mem = self.superrl_low_host_mem_enabled and self.offload_optimizer
+        if not low_host_mem:
+            return True
+
+        if not getattr(self.superrl_low_host_mem_config, "disable_superrl_io", True):
+            raise ValueError("SuperRL-IO cannot remain active with superrl_low_host_mem. "
+                             "The current GDS optimizer swapper requires pipelining; set "
+                             "superrl_low_host_mem.disable_superrl_io=true or disable low-host mode.")
+        return False
+
     def _configure_superrl_io_optimizer(self):
         if not self.offload_optimizer or not self.swap_optimizer:
             raise ValueError("SuperRL-IO requires ZeRO-3 NVMe optimizer offload.")
@@ -775,7 +790,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         low_host_mem = self.superrl_low_host_mem_enabled and self.offload_optimizer
         disable_superrl_io_for_low_host = low_host_mem and getattr(self.superrl_low_host_mem_config,
                                                                   "disable_superrl_io", True)
-        effective_superrl_io = self.superrl_io_enabled and not disable_superrl_io_for_low_host
+        effective_superrl_io = self.superrl_io_active
         if effective_superrl_io:
             ensure_superrl_io_gds_ready(self.superrl_io_config, offload_optimizer_config, aio_config)
 
@@ -973,7 +988,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
                 partitions_by_swapper = {}
                 for param in sub_group:
-                    partitions_by_swapper.setdefault(param.nvme_swapper, []).append(param.ds_numel)
+                    nvme_swapper = getattr(param, "nvme_swapper", None)
+                    if nvme_swapper is None:
+                        raise RuntimeError(f"NVMe-resident parameter {param.ds_id} has no parameter swapper")
+                    partitions_by_swapper.setdefault(nvme_swapper, []).append(param.ds_numel)
 
                 for nvme_swapper, partition_numel in partitions_by_swapper.items():
                     total_elements = sum(partition_numel)
@@ -1183,7 +1201,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
         print_superrl_optimizer_debug(
             f"optimizer_step_begin sub_group={sub_group_id} param_group={param_group_id} "
-            f"numel={fp32_param.numel()} superrl_io={self.superrl_io_enabled}")
+            f"numel={fp32_param.numel()} superrl_io={self.superrl_io_active}")
 
         def step_with_gradscaler(optimizer):
             if self.torch_autocast_gradscaler:
@@ -1195,7 +1213,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 else:
                     self.zenflow_cpu_optimizer_step()
 
-        if self.superrl_io_enabled and self._swappable_optimizer_subgroup(sub_group_id):
+        if self.superrl_io_active and self._swappable_optimizer_subgroup(sub_group_id):
             self.superrl_io_optimizer.param_groups[param_group_id]['params'] = [fp32_param]
             step_with_gradscaler(self.superrl_io_optimizer)
             self.superrl_io_optimizer.param_groups[param_group_id]['params'] = []
@@ -1242,7 +1260,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if len(swap_fp16_params):
             params_by_swapper = collections.defaultdict(lambda: ([], []))
             for fp16_param, fp32_param in zip(swap_fp16_params, swap_fp32_params):
-                grouped_fp16_params, grouped_fp32_params = params_by_swapper[fp16_param.nvme_swapper]
+                nvme_swapper = getattr(fp16_param, "nvme_swapper", None)
+                if nvme_swapper is None:
+                    raise RuntimeError(f"NVMe-resident parameter {fp16_param.ds_id} has no parameter swapper")
+                grouped_fp16_params, grouped_fp32_params = params_by_swapper[nvme_swapper]
                 grouped_fp16_params.append(fp16_param)
                 grouped_fp32_params.append(fp32_param)
 

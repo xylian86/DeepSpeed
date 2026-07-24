@@ -62,8 +62,10 @@ def probe_gds_path(nvme_path, aio_config, timeout_sec=None):
     The probe therefore runs in a subprocess and treats any non-zero return code
     as a clean failure result for the parent training process.
     """
-    if get_accelerator().device_name() != "cuda" or not get_accelerator().is_available():
+    accelerator = get_accelerator()
+    if accelerator.device_name() != "cuda" or not accelerator.is_available():
         return GDSProbeResult(ok=False, message="SuperRL-IO requires an available CUDA accelerator.")
+    device_index = int(accelerator.current_device())
 
     nvme_path = os.fspath(nvme_path)
     os.makedirs(nvme_path, exist_ok=True)
@@ -91,12 +93,14 @@ def probe_gds_path(nvme_path, aio_config, timeout_sec=None):
         overlap_events = sys.argv[5] == "1"
         intra_op_parallelism = int(sys.argv[6])
         probe_bytes = int(sys.argv[7])
+        device_index = int(sys.argv[8])
 
         os.makedirs(path, exist_ok=True)
         probe_file = os.path.join(path, f".deepspeed_superrl_io_gds_probe_{os.getpid()}.bin")
         handle = None
         buffer = None
         try:
+            torch.cuda.set_device(device_index)
             handle = GDSBuilder().load(verbose=False).gds_handle(
                 block_size=block_size,
                 queue_depth=queue_depth,
@@ -104,7 +108,7 @@ def probe_gds_path(nvme_path, aio_config, timeout_sec=None):
                 overlap_events=overlap_events,
                 intra_op_parallelism=intra_op_parallelism,
             )
-            buffer = torch.empty(probe_bytes, dtype=torch.uint8, device=get_accelerator().current_device_name())
+            buffer = torch.empty(probe_bytes, dtype=torch.uint8, device=f"cuda:{device_index}")
             buffer.zero_()
             handle.pin_device_tensor(buffer)
 
@@ -150,6 +154,7 @@ def probe_gds_path(nvme_path, aio_config, timeout_sec=None):
         "1" if overlap_events else "0",
         str(intra_op_parallelism),
         str(probe_bytes),
+        str(device_index),
     ]
 
     if timeout_sec is None:

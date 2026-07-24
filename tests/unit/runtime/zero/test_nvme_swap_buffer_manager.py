@@ -18,6 +18,7 @@ from deepspeed.runtime.swap_tensor.partitioned_param_swapper import AsyncPartiti
     PartitionedParamStatus
 from deepspeed.runtime.swap_tensor.pipelined_optimizer_swapper import ASYNC_SWAP_IN, ASYNC_SWAP_OUT, SYNC_SWAP_IN, \
     SYNC_SWAP_OUT, OptimizerSwapOp, PipelinedOptimizerSwapper
+from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
 
 
 class _FakeAccelerator:
@@ -341,6 +342,72 @@ def test_optimizer_swap_info_allocates_container_offsets():
     assert gradient_offsets == [128, 160]
 
 
+def test_optimizer_swap_info_binds_lazy_direct_buffers(monkeypatch):
+    monkeypatch.setattr(optimizer_swap_utils, "is_direct_io_buffer", lambda _tensor: True)
+    allocator = OptimizerSwapFileAllocator(path="optimizer_state.swp",
+                                           element_size=torch.tensor([], dtype=torch.float32).element_size(),
+                                           numel_alignment=4)
+    param = torch.arange(4, dtype=torch.float32)
+    param.ds_id = "param0"
+    state = torch.arange(4, dtype=torch.float32) + 10
+    state.ds_id = "state0"
+    swap_info = OptimizerStateSwapInfo(parameter=param, numel=4, base_folder="unused", swap_allocator=allocator)
+    swap_info.add_state_tensors([state])
+    buffers = [torch.empty(8, dtype=torch.float32), torch.empty(8, dtype=torch.float32)]
+
+    assert swap_info.unbound_direct_tensor_count() == 2
+    swap_info.bind_unbound_direct_swap_buffers(buffers, aligned_numel=8)
+
+    assert swap_info.unbound_direct_tensor_count() == 0
+    assert torch.equal(param, torch.arange(4, dtype=torch.float32))
+    assert torch.equal(state, torch.arange(4, dtype=torch.float32) + 10)
+    swap_buffers, _, _ = swap_info.get_swap_buffers_and_paths(pinned=True)
+    assert [buffer.numel() for buffer in swap_buffers] == [8, 8]
+
+
+def test_optimizer_swap_info_rejects_wrong_lazy_buffer_count(monkeypatch):
+    monkeypatch.setattr(optimizer_swap_utils, "is_direct_io_buffer", lambda _tensor: True)
+    allocator = OptimizerSwapFileAllocator(path="optimizer_state.swp", element_size=4, numel_alignment=4)
+    param = torch.empty(4, dtype=torch.float32)
+    param.ds_id = "param0"
+    swap_info = OptimizerStateSwapInfo(parameter=param, numel=4, base_folder="unused", swap_allocator=allocator)
+
+    with pytest.raises(ValueError, match="Expected 1 direct swap buffers, got 0"):
+        swap_info.bind_unbound_direct_swap_buffers([], aligned_numel=4)
+
+
+def test_stage3_groups_partitioned_swap_out_by_swapper():
+    class _FakeSwapper:
+
+        def __init__(self):
+            self.calls = []
+
+        def swap_out_partitioned_params(self, dst_fp16_params, src_fp32_params):
+            self.calls.append((dst_fp16_params, [tensor.clone() for tensor in src_fp32_params]))
+
+    first_swapper = _FakeSwapper()
+    second_swapper = _FakeSwapper()
+    first_param = SimpleNamespace(ds_id=1, nvme_swapper=first_swapper)
+    second_param = SimpleNamespace(ds_id=2, nvme_swapper=second_swapper)
+    first_partition = SimpleNamespace(ds_numel=2,
+                                      status=PartitionedParamStatus.NOT_AVAILABLE,
+                                      data=torch.empty(1).data)
+    second_partition = SimpleNamespace(ds_numel=2,
+                                       status=PartitionedParamStatus.NOT_AVAILABLE,
+                                       data=torch.empty(1).data)
+    optimizer = DeepSpeedZeroOptimizer_Stage3.__new__(DeepSpeedZeroOptimizer_Stage3)
+    optimizer.fp32_partitioned_groups_flat = [torch.arange(4, dtype=torch.float32)]
+    optimizer.fp16_groups = [[first_param, second_param]]
+    optimizer.fp16_partitioned_groups = [[first_partition, second_partition]]
+
+    optimizer._partitioned_params_swap_out(0)
+
+    assert first_swapper.calls[0][0] == [first_param]
+    assert torch.equal(first_swapper.calls[0][1][0], torch.tensor([0.0, 1.0]))
+    assert second_swapper.calls[0][0] == [second_param]
+    assert torch.equal(second_swapper.calls[0][1][0], torch.tensor([2.0, 3.0]))
+
+
 def test_lookahead_dram_cache_prefetches_nearest_future_uses(monkeypatch):
     _patch_swap_buffer_manager_deps(monkeypatch)
 
@@ -358,7 +425,9 @@ def test_lookahead_dram_cache_prefetches_nearest_future_uses(monkeypatch):
                                pin_memory_fn=lambda tensor, align_bytes=0: tensor,
                                aligned_numel_fn=lambda numel: numel,
                                host_memory_limit_bytes_fn=lambda: 9,
+                               host_memory_current_bytes_fn=lambda: 0,
                                process_rss_bytes_fn=lambda: 0,
+                               local_world_size_fn=lambda: 1,
                                max_prefetches_per_call=8,
                                max_inflight_prefetches=8)
 
@@ -373,6 +442,38 @@ def test_lookahead_dram_cache_prefetches_nearest_future_uses(monkeypatch):
     assert set(cache.entries.keys()) == {1, 2}
     assert cache.stats()["superrl_cache/hits"] == 1
     assert cache.stats()["superrl_cache/evictions"] == 1
+
+
+def test_lookahead_dram_cache_divides_budget_across_local_ranks():
+    cache = LookaheadDRAMCache(enabled=True,
+                               dtype=torch.float32,
+                               aio_handle=_FakeAIOHandle(),
+                               pin_memory_fn=lambda tensor, align_bytes=0: tensor,
+                               aligned_numel_fn=lambda numel: numel,
+                               host_memory_limit_bytes_fn=lambda: 100,
+                               host_memory_current_bytes_fn=lambda: 0,
+                               process_rss_bytes_fn=lambda: 0,
+                               local_world_size_fn=lambda: 4)
+
+    assert cache.global_memory_cap_bytes == 90
+    assert cache.memory_cap_bytes == 22
+    assert cache._has_process_room_for(22) is True
+    assert cache._has_process_room_for(23) is False
+
+
+def test_lookahead_dram_cache_honors_global_cgroup_usage():
+    cache = LookaheadDRAMCache(enabled=True,
+                               dtype=torch.float32,
+                               aio_handle=_FakeAIOHandle(),
+                               pin_memory_fn=lambda tensor, align_bytes=0: tensor,
+                               aligned_numel_fn=lambda numel: numel,
+                               host_memory_limit_bytes_fn=lambda: 100,
+                               host_memory_current_bytes_fn=lambda: 85,
+                               process_rss_bytes_fn=lambda: 0,
+                               local_world_size_fn=lambda: 1)
+
+    assert cache._has_process_room_for(5) is True
+    assert cache._has_process_room_for(6) is False
 
 
 def test_partitioned_param_swapper_cache_hit_releases_accounting():

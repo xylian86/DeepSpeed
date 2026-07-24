@@ -52,6 +52,32 @@ def _cgroup_memory_limit_bytes():
     return system_memory
 
 
+def _cgroup_memory_current_bytes():
+    candidates = [
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+    ]
+    for path in candidates:
+        current = _read_int(path)
+        if current is not None and current >= 0:
+            return current
+    return None
+
+
+def _local_world_size():
+    for name in ("LOCAL_WORLD_SIZE", "OMPI_COMM_WORLD_LOCAL_SIZE", "MPI_LOCALNRANKS"):
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        try:
+            value = int(value)
+        except ValueError:
+            continue
+        if value > 0:
+            return value
+    return 1
+
+
 def effective_host_memory_limit_bytes():
     return min(_system_memory_bytes(), _cgroup_memory_limit_bytes())
 
@@ -110,7 +136,9 @@ class LookaheadDRAMCache:
                  pin_memory_fn,
                  aligned_numel_fn: Callable[[int], int],
                  host_memory_limit_bytes_fn=effective_host_memory_limit_bytes,
+                 host_memory_current_bytes_fn=_cgroup_memory_current_bytes,
                  process_rss_bytes_fn=process_rss_bytes,
+                 local_world_size_fn=_local_world_size,
                  max_prefetches_per_call=8,
                  max_inflight_prefetches=16):
         self.enabled = enabled
@@ -120,7 +148,9 @@ class LookaheadDRAMCache:
         self.pin_memory_fn = pin_memory_fn
         self.aligned_numel_fn = aligned_numel_fn
         self.host_memory_limit_bytes_fn = host_memory_limit_bytes_fn
+        self.host_memory_current_bytes_fn = host_memory_current_bytes_fn
         self.process_rss_bytes_fn = process_rss_bytes_fn
+        self.local_world_size_fn = local_world_size_fn
         self.max_prefetches_per_call = max_prefetches_per_call
         self.max_inflight_prefetches = max_inflight_prefetches
 
@@ -142,8 +172,16 @@ class LookaheadDRAMCache:
         return sum(entry.nbytes for entry in self.entries.values())
 
     @property
-    def memory_cap_bytes(self):
+    def global_memory_cap_bytes(self):
         return int(self.host_memory_limit_bytes_fn() * HOST_MEMORY_CAP_FRACTION)
+
+    @property
+    def local_world_size(self):
+        return max(1, int(self.local_world_size_fn()))
+
+    @property
+    def memory_cap_bytes(self):
+        return self.global_memory_cap_bytes // self.local_world_size
 
     def _entry_is_attached(self, entry):
         if _is_not_available(entry.param):
@@ -170,8 +208,15 @@ class LookaheadDRAMCache:
                 self._evict(param_id)
 
     def _has_process_room_for(self, nbytes):
-        memory_cap = self.memory_cap_bytes
-        return self.used_bytes + nbytes <= memory_cap and self.process_rss_bytes_fn() + nbytes <= memory_cap
+        if self.used_bytes + nbytes > self.memory_cap_bytes:
+            return False
+
+        global_memory_cap = self.global_memory_cap_bytes
+        current = self.host_memory_current_bytes_fn()
+        if current is not None and current + nbytes > global_memory_cap:
+            return False
+
+        return self.process_rss_bytes_fn() + nbytes <= global_memory_cap
 
     def _ensure_capacity_for(self, nbytes, candidate_next_use):
         self._evict_invalid_entries()
@@ -294,4 +339,6 @@ class LookaheadDRAMCache:
             "superrl_cache/inflight_waits": self.inflight_waits,
             "superrl_cache/capacity_denials": self.capacity_denials,
             "superrl_cache/memory_cap_bytes": self.memory_cap_bytes,
+            "superrl_cache/global_memory_cap_bytes": self.global_memory_cap_bytes,
+            "superrl_cache/local_world_size": self.local_world_size,
         }

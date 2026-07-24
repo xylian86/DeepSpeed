@@ -9,6 +9,8 @@ Functionality for swapping optimizer tensors to/from (NVMe) storage devices.
 
 #include <condition_variable>
 #include <memory>
+#include <mutex>
+#include <string>
 #include "deepspeed_py_io_handle.h"
 
 struct deepspeed_gds_handle_t : deepspeed_io_handle_t {
@@ -45,4 +47,8 @@ struct deepspeed_gds_handle_t : deepspeed_io_handle_t {
                                                             const int64_t file_offset);
 
     static int s_cuFile_init;
+    static std::mutex s_cuFile_mutex;
+    static std::string s_cuFile_config_path;
+    static std::string s_previous_cuFile_config_path;
+    static bool s_had_previous_cuFile_config_path;
 };

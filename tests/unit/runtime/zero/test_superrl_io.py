@@ -6,11 +6,13 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from deepspeed.runtime.swap_tensor.constants import AIO_BLOCK_SIZE, AIO_INTRA_OP_PARALLELISM, AIO_OVERLAP_EVENTS, \
     AIO_QUEUE_DEPTH, AIO_SINGLE_SUBMIT, AIO_THREAD_COUNT
 from deepspeed.runtime.swap_tensor.superrl_io import GDSProbeResult, ensure_superrl_io_gds_ready, \
     make_superrl_io_swap_config, probe_gds_path
+from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
 
 
 def _aio_config():
@@ -128,3 +130,81 @@ def test_gds_probe_requires_cuda_accelerator(monkeypatch):
 
     assert result.ok is False
     assert "CUDA accelerator" in result.message
+
+
+def test_gds_probe_uses_current_cuda_device(monkeypatch, tmp_path):
+    captured = {}
+
+    class _FakeAccelerator:
+
+        def device_name(self):
+            return "cuda"
+
+        def is_available(self):
+            return True
+
+        def current_device(self):
+            return 1
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("deepspeed.runtime.swap_tensor.superrl_io.get_accelerator", lambda: _FakeAccelerator())
+    monkeypatch.setattr("deepspeed.runtime.swap_tensor.superrl_io.subprocess.run", fake_run)
+
+    result = probe_gds_path(tmp_path, _aio_config())
+
+    assert result.ok is True
+    assert captured["cmd"][-1] == "1"
+    assert "torch.cuda.set_device(device_index)" in captured["cmd"][2]
+
+
+def _stage3_mode(superrl_io_enabled=True, low_host_mem_enabled=True, disable_superrl_io=True):
+    optimizer = DeepSpeedZeroOptimizer_Stage3.__new__(DeepSpeedZeroOptimizer_Stage3)
+    optimizer.superrl_io_enabled = superrl_io_enabled
+    optimizer.superrl_low_host_mem_enabled = low_host_mem_enabled
+    optimizer.superrl_low_host_mem_config = SimpleNamespace(disable_superrl_io=disable_superrl_io)
+    optimizer.offload_optimizer = True
+    return optimizer
+
+
+def test_low_host_mem_disables_superrl_io_runtime():
+    optimizer = _stage3_mode()
+
+    assert optimizer._resolve_superrl_io_active() is False
+
+
+def test_low_host_mem_rejects_unsupported_superrl_io_override():
+    optimizer = _stage3_mode(disable_superrl_io=False)
+
+    with pytest.raises(ValueError, match="cannot remain active"):
+        optimizer._resolve_superrl_io_active()
+
+
+def test_low_host_mem_optimizer_step_uses_base_optimizer():
+    class _FakeOptimizer:
+
+        def __init__(self):
+            self.param_groups = [{"params": []}]
+            self.step_count = 0
+
+        def step(self):
+            self.step_count += 1
+
+    optimizer = _stage3_mode()
+    optimizer.superrl_io_active = optimizer._resolve_superrl_io_active()
+    optimizer.superrl_io_optimizer = _FakeOptimizer()
+    optimizer.optimizer = _FakeOptimizer()
+    optimizer.fp32_partitioned_groups_flat = [torch.nn.Parameter(torch.ones(1))]
+    optimizer.sub_group_to_group_id = {0: 0}
+    optimizer.subgroup_to_device = {0: "cpu"}
+    optimizer._swappable_optimizer_subgroup = lambda _sub_group_id: True
+    optimizer.torch_autocast_gradscaler = None
+    optimizer.zenflow = False
+
+    optimizer._optimizer_step(0)
+
+    assert optimizer.optimizer.step_count == 1
+    assert optimizer.superrl_io_optimizer.step_count == 0
