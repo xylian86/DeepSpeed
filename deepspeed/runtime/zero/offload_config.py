@@ -101,8 +101,9 @@ class DeepSpeedZeroOffloadOptimizerConfig(DeepSpeedConfigModel):
 
     @model_validator(mode="after")
     def set_pipeline(self):
-        pipeline = self.pipeline_read or self.pipeline_write
-        self.__dict__["pipeline"] = pipeline
+        self.__dict__["pipeline_read"] = False
+        self.__dict__["pipeline_write"] = False
+        self.__dict__["pipeline"] = False
         return self
 
 

@@ -7,7 +7,7 @@ Functionality of swapping optimizer tensors to/from (NVMe) storage devices.
 """
 
 from deepspeed.utils.logging import logger
-from deepspeed.ops.op_builder import AsyncIOBuilder
+from deepspeed.io import SyncFileIOHandle
 from deepspeed import comm as dist
 
 from deepspeed.runtime.swap_tensor.constants import *
@@ -30,12 +30,7 @@ class PartitionedOptimizerSwapper(OptimizerSwapper):
         super(PartitionedOptimizerSwapper, self).__init__(swap_config, aio_config, base_folder, optimizer,
                                                           largest_numel, device, dtype, timers)
 
-        aio_op = AsyncIOBuilder().load()
-        self.aio_handle = aio_op.aio_handle(block_size=aio_config[AIO_BLOCK_SIZE],
-                                            queue_depth=aio_config[AIO_QUEUE_DEPTH],
-                                            single_submit=aio_config[AIO_SINGLE_SUBMIT],
-                                            overlap_events=aio_config[AIO_OVERLAP_EVENTS],
-                                            intra_op_parallelism=aio_config[AIO_INTRA_OP_PARALLELISM])
+        self.aio_handle = SyncFileIOHandle()
 
         # Overlap swapping out
         self.gradient_swapper = AsyncTensorSwapper(aio_handle=self.aio_handle,

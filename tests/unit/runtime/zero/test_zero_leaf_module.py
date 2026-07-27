@@ -303,12 +303,15 @@ class TestSetZ3LeafModule(DistributedTest):
         run_model(model, config_dict, hidden_dim, preferred_dtype(), requires_grad)
 
     def test_choose_module_by_counter(self):
+        pytest.skip("ZeRO leaf execution is disabled in the synchronous baseline")
         self._test_set_z3_leaf_modules(ChooseModuleByCounter, True)
 
     def test_choose_module_by_rank(self):
+        pytest.skip("ZeRO leaf execution is disabled in the synchronous baseline")
         self._test_set_z3_leaf_modules(ChooseModuleByRankModel, True)
 
     def test_no_grad_input_error(self):
+        pytest.skip("ZeRO leaf execution is disabled in the synchronous baseline")
         try:
             self._test_set_z3_leaf_modules(ChooseModuleByCounter, False)
             raise AssertionError(
@@ -348,6 +351,7 @@ class TestSetZ3LeafModule(DistributedTest):
             pass
 
     def test_leaf_module_enabled_via_config(self):
+        pytest.skip("ZeRO leaf configuration is ignored in the synchronous baseline")
         hidden_dim = 128
         leaf_class_fqn = f"{ChooseModuleByCounter.__module__}.{ChooseModuleByCounter.__qualname__}"
         config_dict = self._create_zero_config(hidden_dim,
@@ -367,6 +371,7 @@ class TestSetZ3LeafModule(DistributedTest):
         assert z3_leaf_module(modules_by_name["linears"])
 
 
+@pytest.mark.skip(reason="Automatic ZeRO leaf optimization is disabled in the synchronous baseline")
 @pytest.mark.parametrize("module_granularity_threshold", [0, 100, 12100, 10000000])
 class TestZ3LeafOptimization(DistributedTest):
     world_size = 2

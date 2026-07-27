@@ -568,6 +568,7 @@ class LeafNonScalarModel(torch.nn.Module):
         return self.branches[0](x) + self.branches[1](x)
 
 
+@pytest.mark.skip(reason="ZeRO leaf execution is disabled in the synchronous baseline")
 @pytest.mark.parametrize("zero_stage", [3])
 class TestZeroUserBackwardLeafModule(DistributedTest):
     """Test leaf module behavior during backward passes in ZeRO Stage 3"""

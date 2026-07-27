@@ -154,13 +154,8 @@ class DeepSpeedZeRoOffload(object):
 
         self.fast_sharding_for_leaf_module = False
 
-        if zero_module_granularity_threshold > 0:
-            self.min_granularity_value = sys.maxsize
-            self.min_granularity_layer = None
-            self.granularity_info = set()
-            self.z3_leaf_layers = []
-            self._set_z3_leaf_modules_by_threshold(module, zero_module_granularity_threshold)
-            self.fast_sharding_for_leaf_module = True
+        # The synchronous baseline intentionally never creates ZeRO leaf modules,
+        # including the automatic module-granularity path.
 
         self.param_coordinator = PartitionedParameterCoordinator(
             prefetch_bucket_sz=self._prefetch_bucket_sz,

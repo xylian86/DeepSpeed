@@ -6,3 +6,4 @@
 from .py_file_writer import PyFileWriter
 from .fast_file_writer import FastFileWriter, FastFileWriterConfig
 from .mock_file_writer import MockFileWriter
+from .sync_file_io import SyncFileIOHandle

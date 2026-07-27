@@ -78,7 +78,6 @@ from deepspeed.runtime import lr_schedules
 from deepspeed.utils import groups
 from deepspeed.utils import logger, log_dist, log_dist_once, instrument_w_nvtx
 from deepspeed.utils.torch import required_torch_version
-from deepspeed.utils.z3_leaf_module import apply_zero_leaf_module_config
 from deepspeed.utils.timer import NoopTimer, ThroughputTimer, SynchronizedWallClockTimer, \
     FORWARD_MICRO_TIMER, BACKWARD_MICRO_TIMER, BACKWARD_INNER_MICRO_TIMER, BACKWARD_REDUCE_MICRO_TIMER, \
     STEP_MICRO_TIMER, \
@@ -140,6 +139,16 @@ try:
 except ImportError:
     # Fail silently so we don't spam logs unnecessarily if user isn't using amp
     APEX_INSTALLED = False
+
+
+def _clear_zero_leaf_module_flags(module: Module) -> int:
+    """Disable all preconfigured ZeRO leaf tags for the synchronous baseline."""
+    cleared = 0
+    for submodule in module.modules():
+        if getattr(submodule, "_z3_leaf", False):
+            submodule._z3_leaf = False
+            cleared += 1
+    return cleared
 
 
 def split_half_float_double_sparse(tensors):
@@ -1342,7 +1351,7 @@ class DeepSpeedEngine(Module):
 
     def _configure_distributed_model(self, model):
         self._set_client_model(model)
-        apply_zero_leaf_module_config(self.module, getattr(self._config.zero_config, "leaf_module", None))
+        _clear_zero_leaf_module_flags(self.module)
         is_zero_init_model = self.zero_optimization_partition_weights() and any(
             [hasattr(param, "ds_id") for param in self.module.parameters()])
 
