@@ -649,6 +649,60 @@ def test_warmup_cosine_lr_linear_warmup_type_produces_linear_ratios():
         assert scheduler.get_lr_ratio() == pytest.approx(step / warmup_num_steps)
 
 
+def _one_cycle_lrs(first_stair_count, steps=16, first_step_size=8, second_step_size=8, second_stair_count=None):
+    param = torch.nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.Adam([{"params": [param], "lr": 0.001}], betas=(0.9, 0.99))
+    scheduler = OneCycle(optimizer=optimizer,
+                         cycle_min_lr=0.001,
+                         cycle_max_lr=0.01,
+                         cycle_first_step_size=first_step_size,
+                         cycle_second_step_size=second_step_size,
+                         cycle_first_stair_count=first_stair_count,
+                         cycle_second_stair_count=second_stair_count)
+    lrs = []
+    for _ in range(steps):
+        scheduler.step()
+        lrs.append(scheduler.get_lr()[0])
+    return lrs
+
+
+def test_one_cycle_stair_count_holds_lr_flat():
+    # cycle_first_stair_count / cycle_second_stair_count are documented, exposed as CLI
+    # flags and plumbed through the config, but were read nowhere, so every value produced
+    # the continuous schedule. A stair count must hold the lr flat across each step of the
+    # half cycle, and 0 must stay continuous.
+    continuous = _one_cycle_lrs(0)
+    assert len(set(continuous[:8])) == 8
+
+    stairs = _one_cycle_lrs(2)
+    assert stairs != continuous
+    # two stairs over an eight-batch half cycle: the lr changes far less often
+    assert len(set(stairs[:8])) < len(set(continuous[:8]))
+    # and it is flat within a stair rather than moving every batch
+    assert stairs[0] == stairs[1]
+
+    # a stair count matching the half-cycle length is the continuous schedule again
+    assert _one_cycle_lrs(8) == continuous
+
+
+def test_one_cycle_stair_count_handles_asymmetric_cycle():
+    continuous = _one_cycle_lrs(0, steps=31, first_step_size=10, second_step_size=21, second_stair_count=0)
+
+    # Floating point roundoff in the normalized scale must not floor away the peak or
+    # shift an exact batch-aligned stair down by one.
+    batch_aligned = _one_cycle_lrs(10, steps=31, first_step_size=10, second_step_size=21, second_stair_count=21)
+    assert batch_aligned == pytest.approx(continuous)
+    assert batch_aligned[9] == pytest.approx(0.01)
+
+    # The first and second stair counts must apply only to their respective halves.
+    first_only = _one_cycle_lrs(2, steps=31, first_step_size=10, second_step_size=21, second_stair_count=0)
+    second_only = _one_cycle_lrs(0, steps=31, first_step_size=10, second_step_size=21, second_stair_count=3)
+    assert first_only[:10] != continuous[:10]
+    assert first_only[10:] == continuous[10:]
+    assert second_only[:10] == continuous[:10]
+    assert second_only[10:30] != continuous[10:30]
+
+
 @pytest.mark.parametrize("bad_step_size", [0, -5])
 def test_lr_range_test_rejects_nonpositive_step_size(bad_step_size):
     # lr_range_test_step_size divides the step index in _continuous_interval and
