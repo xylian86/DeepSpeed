@@ -16,7 +16,7 @@ from deepspeed.runtime.lr_schedules import ONE_CYCLE, CYCLE_MIN_LR, CYCLE_MAX_LR
 from deepspeed.runtime.lr_schedules import CYCLE_MIN_MOM, CYCLE_MAX_MOM, DECAY_MOM_RATE
 from deepspeed.runtime.lr_schedules import WARMUP_DECAY_LR, TOTAL_NUM_STEPS
 from deepspeed.runtime.lr_schedules import WARMUP_COSINE_LR, WARMUP_MIN_RATIO, COS_MIN_RATIO, WarmupCosineLR
-from deepspeed.runtime.lr_schedules import WarmupLR, WarmupDecayLR
+from deepspeed.runtime.lr_schedules import WarmupLR, WarmupDecayLR, LRRangeTest, OneCycle
 
 
 def _verify_continuous_decrease(values):
@@ -627,3 +627,52 @@ def test_warmup_cosine_lr_linear_warmup_type_produces_linear_ratios():
     for step in range(warmup_num_steps):
         scheduler.step(step)
         assert scheduler.get_lr_ratio() == pytest.approx(step / warmup_num_steps)
+
+
+@pytest.mark.parametrize("bad_step_size", [0, -5])
+def test_lr_range_test_rejects_nonpositive_step_size(bad_step_size):
+    # lr_range_test_step_size divides the step index in _continuous_interval and
+    # _staircase_interval, so the first step() with a value of 0 raises ZeroDivisionError.
+    # Mirror the WarmupLR positive-integer guard and reject the misconfig at construction.
+    param = torch.nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.SGD([param], lr=0.1)
+
+    with pytest.raises(ValueError):
+        LRRangeTest(optimizer, lr_range_test_step_size=bad_step_size)
+
+
+@pytest.mark.parametrize("first, second", [(0, 0), (0, None), (-1, None), (0, 100), (100, -1)])
+def test_one_cycle_rejects_nonpositive_step_sizes(first, second):
+    # _initialize_cycle divides cycle_first_step_size by total_size, and _get_scale_factor
+    # then divides by the resulting step_ratio. A total of 0 raises ZeroDivisionError at
+    # construction; a zero first half keeps total_size positive but sets step_ratio to 0,
+    # so the first get_lr() raises instead. Reject both shapes with a clear ValueError.
+    param = torch.nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.SGD([param], lr=0.1)
+
+    with pytest.raises(ValueError):
+        OneCycle(optimizer,
+                 cycle_min_lr=0.001,
+                 cycle_max_lr=0.1,
+                 cycle_first_step_size=first,
+                 cycle_second_step_size=second)
+
+
+def test_one_cycle_allows_zero_second_step_size():
+    # The mirror case is not degenerate: a zero second half gives step_ratio 1.0, and x
+    # stays below 1.0 in _get_scale_factor, so no division by zero is reachable. Pin it so
+    # the guard above does not grow into rejecting a working configuration.
+    param = torch.nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.SGD([param], lr=0.1)
+
+    scheduler = OneCycle(optimizer,
+                         cycle_min_lr=0.001,
+                         cycle_max_lr=0.1,
+                         cycle_first_step_size=100,
+                         cycle_second_step_size=0)
+
+    assert scheduler.step_ratio == 1.0
+    assert scheduler.get_lr() == [pytest.approx(0.001)]
+    for _ in range(3):
+        scheduler.step()
+    assert scheduler.get_lr()[0] > 0.001
