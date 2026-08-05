@@ -22,7 +22,7 @@ struct deepspeed_io_handle_t {
     std::vector<std::shared_ptr<struct deepspeed_aio_thread_t>> _thread_contexts;
     std::vector<std::thread> _threads;
     int _num_pending_ops;
-    std::unique_ptr<struct deepspeed_pin_tensor_t> _pinned_tensor_mgr;
+    std::shared_ptr<struct deepspeed_pin_tensor_t> _pinned_tensor_mgr;
 
     deepspeed_io_handle_t(const int block_size,
                           const int queue_depth,
@@ -75,6 +75,8 @@ struct deepspeed_io_handle_t {
                                         const torch::Tensor& example_tensor);
 
     bool free_cpu_locked_tensor(torch::Tensor&);
+
+    bool is_pinned(const torch::Tensor& buffer);
 
     int wait();
 
