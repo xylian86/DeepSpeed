@@ -134,7 +134,7 @@ class AsyncPartitionedParameterSwapper(object):
         if self.use_gds:
             self.aio_read_handle.pin_device_tensor(self.buffers)
         else:
-            self.buffers = get_accelerator().pin_memory(self.buffers, align_bytes=0)
+            self.buffers = get_accelerator().pin_memory(self.buffers)
 
         self.swap_out_params = []
 
@@ -533,8 +533,7 @@ class AsyncPartitionedParameterSwapper(object):
         aligned_numel = sum([self._io_aligned_numel(numel) for numel in partition_num_elems])
         self.partitioned_swap_buffer = get_accelerator().pin_memory(torch.zeros(aligned_numel,
                                                                                 device='cpu',
-                                                                                dtype=self.dtype),
-                                                                    align_bytes=0)
+                                                                                dtype=self.dtype))
         self.partitioned_swap_pool = SwapBufferPool([self.partitioned_swap_buffer])
 
     def swap_out_partitioned_params(self, dst_fp16_params, src_fp32_params):

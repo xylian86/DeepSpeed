@@ -461,7 +461,7 @@ class SwapBufferManager(object):
         if self.pin_memory_fn is not None:
             buffer = self.pin_memory_fn(buffer)
         elif self.device == 'cpu':
-            buffer = get_accelerator().pin_memory(buffer, align_bytes=0)
+            buffer = get_accelerator().pin_memory(buffer)
 
         self.all_buffers[index] = buffer
         self.pin_memory_time_sec += time.time() - start_time

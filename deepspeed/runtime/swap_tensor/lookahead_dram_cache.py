@@ -267,7 +267,7 @@ class LookaheadDRAMCache:
 
             path = path_fn(param)
             buffer = torch.empty(aligned_numel, device="cpu", dtype=self.dtype)
-            buffer = self.pin_memory_fn(buffer, align_bytes=0)
+            buffer = self.pin_memory_fn(buffer)
             entry = _CacheEntry(param=param,
                                 buffer=buffer,
                                 aligned_numel=aligned_numel,
