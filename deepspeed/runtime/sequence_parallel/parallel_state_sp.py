@@ -90,6 +90,14 @@ def get_sequence_data_parallel_rank():
     return dist.get_rank(group=get_sequence_data_parallel_group())
 
 
+def destroy_sequence_parallel() -> None:
+    """Forget sequence-parallel groups after a failed or completed registration."""
+    global _SEQUENCE_PARALLEL_GROUP
+    global _SEQUENCE_DATA_PARALLEL_GROUP
+    _SEQUENCE_PARALLEL_GROUP = None
+    _SEQUENCE_DATA_PARALLEL_GROUP = None
+
+
 # since we only have 1 additional dimension over DP, we can just alias MP with SP
 get_model_parallel_rank = get_sequence_parallel_rank
 get_model_parallel_world_size = get_sequence_parallel_world_size

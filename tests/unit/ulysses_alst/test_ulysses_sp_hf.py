@@ -7,6 +7,7 @@ UlyssesPlus: UlyssesSPHF tests
 """
 
 import deepspeed.runtime.sequence_parallel.ulysses_sp as ulysses_sp
+import deepspeed.runtime.sequence_parallel.ulysses_linear_attention as linear_cp
 from deepspeed.runtime.sequence_parallel.ulysses_sp import UlyssesSPAttentionHF, UlyssesSPDataLoaderAdapter
 from deepspeed.runtime.utils import move_to_device
 from deepspeed.utils import groups
@@ -18,7 +19,6 @@ from unit.util import torch_assert_equal, torch_assert_close, torch_assert_dicts
 import deepspeed
 import deepspeed.comm as dist
 import pytest
-import sys
 import torch
 import types
 
@@ -34,173 +34,305 @@ def get_grad(param, zero_stage):
 
 class TestLinearAttentionCPHelpers:
 
-    def test_position_ids_to_packed_cu_seqlens_single_sequence(self):
-        position_ids = torch.tensor([[0, 1, 2, 3]])
+    class FakeNorm(torch.nn.Module):
 
-        cu_seqlens = ulysses_sp._position_ids_to_packed_cu_seqlens(position_ids)
+        def forward(self, hidden_states, gate):
+            return hidden_states
 
-        torch_assert_equal(cu_seqlens, torch.tensor([0, 4], dtype=torch.long))
+    class FakeGatedDeltaNet(torch.nn.Module):
 
-    def test_position_ids_to_packed_cu_seqlens_packed_sequence(self):
-        position_ids = torch.tensor([[0, 1, 2, 0, 1, 0, 1, 2]])
+        def __init__(self):
+            super().__init__()
+            self.in_proj_qkv = torch.nn.Linear(4, 12, bias=False)
+            self.in_proj_z = torch.nn.Linear(4, 4, bias=False)
+            self.in_proj_b = torch.nn.Linear(4, 1, bias=False)
+            self.in_proj_a = torch.nn.Linear(4, 1, bias=False)
+            self.conv1d = torch.nn.Conv1d(12, 12, kernel_size=1, groups=12)
+            self.activation = "silu"
+            self.num_v_heads = 1
+            self.num_k_heads = 1
+            self.head_k_dim = 4
+            self.head_v_dim = 4
+            self.conv_kernel_size = 1
+            self.A_log = torch.nn.Parameter(torch.zeros(1))
+            self.dt_bias = torch.nn.Parameter(torch.zeros(1))
+            self.norm = TestLinearAttentionCPHelpers.FakeNorm()
+            self.out_proj = torch.nn.Linear(4, 4, bias=False)
+            self.original_forward_calls = 0
 
-        cu_seqlens = ulysses_sp._position_ids_to_packed_cu_seqlens(position_ids)
+        def forward(self, hidden_states, cache_params=None, attention_mask=None, **kwargs):
+            self.original_forward_calls += 1
+            return hidden_states
 
-        torch_assert_equal(cu_seqlens, torch.tensor([0, 3, 5, 8], dtype=torch.long))
+    class FakeDecoderLayer(torch.nn.Module):
 
-    def test_modeling_module_candidates_strip_text_suffix(self):
-        cfg = types.SimpleNamespace(model_type="qwen3_5_text")
+        def __init__(self):
+            super().__init__()
+            self.block_type = "linear_attention"
+            self.linear_attn = TestLinearAttentionCPHelpers.FakeGatedDeltaNet()
 
-        candidates = list(ulysses_sp._modeling_module_candidates(cfg, cfg))
+        def forward(self, hidden_states, position_ids=None, **kwargs):
+            return self.linear_attn(hidden_states, **kwargs)
 
-        assert "transformers.models.qwen3_5_text.modeling_qwen3_5_text" in candidates
-        assert "transformers.models.qwen3_5.modeling_qwen3_5" in candidates
+    class FakeTextModel(torch.nn.Module):
 
-    def test_linear_attention_cp_noops_for_non_linear_config(self, monkeypatch):
+        def __init__(self, num_layers=2):
+            super().__init__()
+            self.layers = torch.nn.ModuleList(
+                [TestLinearAttentionCPHelpers.FakeDecoderLayer() for _ in range(num_layers)])
 
-        def fail_if_called(_name):
-            raise AssertionError("FLA package version should not be probed for non-linear configs")
+        def forward(self, hidden_states, position_ids=None, **kwargs):
+            for layer in self.layers:
+                hidden_states = layer(hidden_states, position_ids=position_ids, **kwargs)
+            return hidden_states
 
-        monkeypatch.setattr(ulysses_sp.importlib_metadata, "version", fail_if_called)
-        cfg = types.SimpleNamespace(model_type="llama", layer_types=["full_attention"])
+    class FakeModel(torch.nn.Module):
 
-        assert ulysses_sp._register_linear_attention_cp(cfg, cfg) == 0
+        def __init__(self, num_layers=2):
+            super().__init__()
+            self.text_model = TestLinearAttentionCPHelpers.FakeTextModel(num_layers)
 
-    def test_linear_attention_cp_version_gate(self, monkeypatch):
+    @staticmethod
+    def fake_fla_ops(build_cp_context=None):
 
-        def fake_version(_name):
-            return "0.4.1"
-
-        monkeypatch.setattr(ulysses_sp.importlib_metadata, "version", fake_version)
-
-        with pytest.raises(ImportError, match=">= 0.4.2"):
-            ulysses_sp._load_linear_attention_cp_ops()
-
-    def test_gated_delta_state_layout_kwargs_match_fla_version_signatures(self):
-
-        def old_chunk_gated_delta_rule(transpose_state_layout=False, **kwargs):
-            return transpose_state_layout, kwargs
-
-        def new_chunk_gated_delta_rule(state_v_first=False, **kwargs):
-            return state_v_first, kwargs
-
-        assert ulysses_sp._gated_delta_state_layout_kwargs(old_chunk_gated_delta_rule) == {
-            "transpose_state_layout": True
-        }
-        assert ulysses_sp._gated_delta_state_layout_kwargs(new_chunk_gated_delta_rule) == {"state_v_first": True}
-
-    def test_linear_attention_cp_ignores_transformers_forward_flags(self, monkeypatch):
-
-        class FakeNorm(torch.nn.Module):
-
-            def forward(self, hidden_states, gate):
-                return hidden_states
-
-        class FakeGatedDeltaNet(torch.nn.Module):
-
-            def __init__(self):
-                super().__init__()
-                self.in_proj_qkv = torch.nn.Linear(4, 12, bias=False)
-                self.in_proj_z = torch.nn.Linear(4, 4, bias=False)
-                self.in_proj_b = torch.nn.Linear(4, 1, bias=False)
-                self.in_proj_a = torch.nn.Linear(4, 1, bias=False)
-                self.conv1d = torch.nn.Conv1d(12, 12, kernel_size=1, groups=12)
-                self.activation = "silu"
-                self.num_v_heads = 1
-                self.num_k_heads = 1
-                self.head_k_dim = 4
-                self.head_v_dim = 4
-                self.conv_kernel_size = 1
-                self.A_log = torch.nn.Parameter(torch.zeros(1))
-                self.dt_bias = torch.nn.Parameter(torch.zeros(1))
-                self.norm = FakeNorm()
-                self.out_proj = torch.nn.Linear(4, 4, bias=False)
-
-            def chunk_gated_delta_rule(self, query, key, value, g=None, beta=None, cp_context=None, **kwargs):
-                return value, None
-
-        def fake_causal_conv1d(x, weight=None, bias=None, activation=None, cp_context=None):
-            return x
-
-        monkeypatch.setattr(ulysses_sp, "_get_sequence_parallel_info", lambda: (None, 2, 0))
-        monkeypatch.setattr(ulysses_sp, "_load_linear_attention_cp_ops", lambda: (None, fake_causal_conv1d))
-        monkeypatch.setattr(ulysses_sp, "_build_linear_attention_cp_context", lambda **kwargs: object())
-
-        layer = FakeGatedDeltaNet()
-        hidden_states = torch.randn(1, 2, 4)
-
-        output = ulysses_sp._gated_delta_cp_forward(
-            layer,
-            hidden_states,
-            use_cache=False,
-            output_hidden_states=True,
-            output_attentions=False,
-            return_dict=True,
-        )
-
-        assert output.shape == hidden_states.shape
-
-    def test_linear_attention_cp_patches_gdn_like_class(self, monkeypatch):
-        modeling_module_name = "transformers.models.fake_linear.modeling_fake_linear"
-        modeling_module = types.ModuleType(modeling_module_name)
-
-        class FakeGatedDeltaNet(torch.nn.Module):
-
-            def forward(self, hidden_states, cache_params=None, attention_mask=None, position_ids=None):
-                return hidden_states
-
-        modeling_module.FakeGatedDeltaNet = FakeGatedDeltaNet
-
-        fla_module = types.ModuleType("fla")
-        fla_ops_module = types.ModuleType("fla.ops")
-        fla_cp_module = types.ModuleType("fla.ops.cp")
-        fla_modules_module = types.ModuleType("fla.modules")
-        fla_conv_module = types.ModuleType("fla.modules.conv")
-
-        class FakeFLACPContext:
-            pass
-
-        def fake_build_cp_context(*args, **kwargs):
-            return FakeFLACPContext()
+        def default_build_cp_context(**kwargs):
+            return object()
 
         def fake_causal_conv1d(x, weight=None, bias=None, activation=None, cp_context=None):
             return x, None
 
-        fla_cp_module.FLACPContext = FakeFLACPContext
-        fla_cp_module.build_cp_context = fake_build_cp_context
-        fla_conv_module.causal_conv1d = fake_causal_conv1d
+        def fake_chunk_gated_delta_rule(query, key, value, g=None, beta=None, cp_context=None, **kwargs):
+            return value, None
 
-        fla_module.ops = fla_ops_module
-        fla_ops_module.cp = fla_cp_module
-        fla_module.modules = fla_modules_module
-        fla_modules_module.conv = fla_conv_module
+        return linear_cp._FLACPOps(
+            build_cp_context or default_build_cp_context,
+            fake_causal_conv1d,
+            fake_chunk_gated_delta_rule,
+        )
 
-        for name, module in (
-            ("fla", fla_module),
-            ("fla.ops", fla_ops_module),
-            ("fla.ops.cp", fla_cp_module),
-            ("fla.modules", fla_modules_module),
-            ("fla.modules.conv", fla_conv_module),
-            (modeling_module_name, modeling_module),
-        ):
-            monkeypatch.setitem(sys.modules, name, module)
+    def test_position_ids_to_packed_cu_seqlens(self):
+        position_ids = torch.tensor([[0, 1, 2, 0, 1, 0, 1, 2]])
 
-        monkeypatch.setattr(ulysses_sp.importlib_metadata, "version", lambda _name: "0.5.0")
+        cu_seqlens = linear_cp.position_ids_to_packed_cu_seqlens(position_ids)
 
-        cfg = types.SimpleNamespace(model_type="fake_linear", layer_types=["linear_attention"])
-        original_forward = FakeGatedDeltaNet.forward
+        torch_assert_equal(cu_seqlens, torch.tensor([0, 3, 5, 8], dtype=torch.long))
 
+    def test_non_linear_kimi_config_does_not_probe_fla(self, monkeypatch):
+
+        def fail_if_called():
+            raise AssertionError("FLA should not be probed for a full-attention config")
+
+        monkeypatch.setattr(linear_cp, "load_fla_cp_ops", fail_if_called)
+        cfg = types.SimpleNamespace(model_type="kimi_k25", layer_types=["full_attention"])
+
+        assert linear_cp.prepare_qwen35_linear_attention_cp(torch.nn.Identity(), cfg, cfg, "sdpa", False) is None
+
+    def test_unsupported_linear_model_type_fails_without_global_patching(self):
+        cfg = types.SimpleNamespace(model_type="future_linear", layer_types=["linear_attention"])
+
+        with pytest.raises(RuntimeError, match="only Qwen3.5"):
+            linear_cp.prepare_qwen35_linear_attention_cp(torch.nn.Identity(), cfg, cfg, "sdpa", False)
+
+    def test_linear_attention_cp_version_gate(self, monkeypatch):
+        monkeypatch.setattr(linear_cp.importlib_metadata, "version", lambda _name: "0.4.1")
+
+        with pytest.raises(ImportError, match=">= 0.4.2"):
+            linear_cp.load_fla_cp_ops()
+
+    def test_current_style_qwen_layer_is_supported_and_patch_is_reversible(self, monkeypatch):
+        model = self.FakeModel()
+        cfg = types.SimpleNamespace(model_type="qwen3_5", layer_types=["linear_attention", "linear_attention"])
+        monkeypatch.setattr(linear_cp, "load_fla_cp_ops", self.fake_fla_ops)
+        class_forward = type(model.text_model.layers[0].linear_attn).forward
+
+        prepared = linear_cp.prepare_qwen35_linear_attention_cp(model, cfg, cfg, "flash_attention_2", False)
+        registration = linear_cp.create_qwen35_linear_attention_registration(prepared, object(), 2)
+        registration.install()
+
+        assert "forward" in model.text_model.layers[0].linear_attn.__dict__
+        assert type(model.text_model.layers[0].linear_attn).forward is class_forward
+
+        registration.restore()
+        assert "forward" not in model.text_model.layers[0].linear_attn.__dict__
+        assert type(model.text_model.layers[0].linear_attn).forward is class_forward
+
+    def test_metadata_is_built_once_and_shared_by_all_linear_layers(self, monkeypatch):
+        model = self.FakeModel(num_layers=3)
+        build_calls = []
+        gather_calls = []
+
+        def fake_build_cp_context(**kwargs):
+            build_calls.append(kwargs)
+            return object()
+
+        def fake_all_gather(outputs, local, group=None):
+            gather_calls.append(local.clone())
+            outputs[0].copy_(local)
+            outputs[1].copy_(torch.tensor([[2, 3]], dtype=local.dtype))
+
+        registration = linear_cp.Qwen35LinearAttentionCPRegistration(
+            model=model,
+            text_model=model.text_model,
+            decoder_layers=list(model.text_model.layers),
+            linear_layers=[layer.linear_attn for layer in model.text_model.layers],
+            fla_ops=self.fake_fla_ops(fake_build_cp_context),
+            sp_group=object(),
+            sp_world_size=2,
+            core_attn_implementation="flash_attention_2",
+            disable_in_eval=False,
+        )
+        monkeypatch.setattr(linear_cp.dist, "all_gather", fake_all_gather)
+        registration.install()
         try:
-            installed = ulysses_sp._register_linear_attention_cp(cfg, cfg)
-            installed_again = ulysses_sp._register_linear_attention_cp(cfg, cfg)
-
-            assert installed == 1
-            assert installed_again == 0
-            assert FakeGatedDeltaNet.forward is ulysses_sp._gated_delta_cp_forward
-            assert ulysses_sp._LINEAR_ATTENTION_CP_ORIGINAL_FORWARDS[FakeGatedDeltaNet] is original_forward
+            output = model.text_model(
+                torch.randn(1, 2, 4),
+                position_ids=torch.tensor([[0, 1]]),
+            )
         finally:
-            FakeGatedDeltaNet.forward = original_forward
-            ulysses_sp._LINEAR_ATTENTION_CP_ORIGINAL_FORWARDS.pop(FakeGatedDeltaNet, None)
+            registration.restore()
+
+        assert output.shape == (1, 2, 4)
+        assert len(gather_calls) == 1
+        assert len(build_calls) == 1
+
+    def test_explicit_packed_metadata_takes_precedence(self, monkeypatch):
+        model = self.FakeModel(num_layers=1)
+        built = []
+
+        def fake_build_cp_context(**kwargs):
+            built.append(kwargs)
+            return object()
+
+        def fake_all_gather(outputs, local, group=None):
+            outputs[0].copy_(local)
+            outputs[1].copy_(torch.tensor([[2, 0]], dtype=local.dtype))
+
+        registration = linear_cp.Qwen35LinearAttentionCPRegistration(
+            model=model,
+            text_model=model.text_model,
+            decoder_layers=list(model.text_model.layers),
+            linear_layers=[model.text_model.layers[0].linear_attn],
+            fla_ops=self.fake_fla_ops(fake_build_cp_context),
+            sp_group=object(),
+            sp_world_size=2,
+            core_attn_implementation="flash_attention_2",
+            disable_in_eval=False,
+        )
+        monkeypatch.setattr(linear_cp.dist, "all_gather", fake_all_gather)
+
+        metadata = registration._build_metadata(
+            torch.tensor([[0, 1]]),
+            explicit_cu_seqlens=torch.tensor([0, 3, 4]),
+        )
+
+        torch_assert_equal(metadata.global_cu_seqlens, torch.tensor([0, 3, 4]))
+        torch_assert_equal(built[0]["cu_seqlens"], torch.tensor([0, 3, 4]))
+
+    def test_packed_sdpa_fails_before_any_layer_runs(self, monkeypatch):
+        model = self.FakeModel(num_layers=1)
+
+        def fake_all_gather(outputs, local, group=None):
+            outputs[0].copy_(local)
+            outputs[1].copy_(torch.tensor([[0, 1]], dtype=local.dtype))
+
+        registration = linear_cp.Qwen35LinearAttentionCPRegistration(
+            model=model,
+            text_model=model.text_model,
+            decoder_layers=list(model.text_model.layers),
+            linear_layers=[model.text_model.layers[0].linear_attn],
+            fla_ops=self.fake_fla_ops(),
+            sp_group=object(),
+            sp_world_size=2,
+            core_attn_implementation="sdpa",
+            disable_in_eval=False,
+        )
+        monkeypatch.setattr(linear_cp.dist, "all_gather", fake_all_gather)
+
+        with pytest.raises(RuntimeError, match="Packed Ulysses SP is not supported with SDPA"):
+            registration._build_metadata(torch.tensor([[0, 1]]))
+
+    def test_disable_in_eval_delegates_to_original_linear_forward(self):
+        model = self.FakeModel(num_layers=1)
+        registration = linear_cp.Qwen35LinearAttentionCPRegistration(
+            model=model,
+            text_model=model.text_model,
+            decoder_layers=list(model.text_model.layers),
+            linear_layers=[model.text_model.layers[0].linear_attn],
+            fla_ops=self.fake_fla_ops(),
+            sp_group=object(),
+            sp_world_size=2,
+            core_attn_implementation="flash_attention_2",
+            disable_in_eval=True,
+        )
+        model.eval()
+        registration.install()
+        try:
+            model.text_model(torch.randn(1, 4, 4), position_ids=torch.arange(4).unsqueeze(0))
+        finally:
+            registration.restore()
+
+        assert model.text_model.layers[0].linear_attn.original_forward_calls == 1
+
+    def test_registration_rolls_back_attention_and_linear_patches(self, monkeypatch):
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        import deepspeed.runtime.sequence_parallel.parallel_state_sp as mpu
+
+        original_sdpa = ALL_ATTENTION_FUNCTIONS["sdpa"]
+        destroyed = []
+
+        class FailingLinearRegistration:
+            restored = False
+
+            def install(self):
+                raise RuntimeError("linear installation failed")
+
+            def restore(self):
+                self.restored = True
+
+        failing_registration = FailingLinearRegistration()
+        arch_cfg = types.SimpleNamespace(
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            hidden_size=64,
+            num_hidden_layers=2,
+        )
+        config = types.SimpleNamespace(
+            _attn_implementation="sdpa",
+            get_text_config=lambda: arch_cfg,
+        )
+        model = types.SimpleNamespace(config=config)
+
+        class FakeUlysses(UlyssesSPAttentionHF):
+
+            def __init__(self, attn, **kwargs):
+                torch.nn.Module.__init__(self)
+                self.attn = attn
+
+        monkeypatch.setattr(ulysses_sp, "_ACTIVE_ATTENTION_REGISTRATIONS", {})
+        monkeypatch.setattr(ulysses_sp, "_ACTIVE_LINEAR_ATTENTION_REGISTRATION", None)
+        monkeypatch.setattr(ulysses_sp, "prepare_qwen35_linear_attention_cp", lambda **kwargs: object())
+        monkeypatch.setattr(
+            ulysses_sp,
+            "create_qwen35_linear_attention_registration",
+            lambda *args, **kwargs: failing_registration,
+        )
+        monkeypatch.setattr(mpu, "initialize_sequence_parallel", lambda **kwargs: None)
+        monkeypatch.setattr(mpu, "get_sequence_parallel_group", lambda: object())
+        monkeypatch.setattr(mpu, "get_sequence_parallel_world_size", lambda: 2)
+        monkeypatch.setattr(mpu, "destroy_sequence_parallel", lambda: destroyed.append(True))
+
+        with pytest.raises(RuntimeError, match="linear installation failed"):
+            FakeUlysses.register_with_transformers(
+                model_name_or_path=model,
+                core_attn_implementation="sdpa",
+                sequence_parallel_size=2,
+                micro_batch_size=1,
+            )
+
+        assert ALL_ATTENTION_FUNCTIONS["sdpa"] is original_sdpa
+        assert failing_registration.restored
+        assert destroyed == [True]
+        assert ulysses_sp._ACTIVE_ATTENTION_REGISTRATIONS == {}
 
 
 @pytest.mark.parametrize("zero_stage", [2, 3])
@@ -572,7 +704,8 @@ class TestUlyssesSPHFFlexAttention(DistributedTest):
     world_size = 2
     non_daemonic_procs = True
 
-    def test_ulysses_sp_hf_flex_attention(self, zero_stage):
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_ulysses_sp_hf_flex_attention(self, zero_stage, packed):
         core_attn_implementation = "flex_attention"
         # flex_attention's compiled kernel requires head_dim >= 16.
         # tiny-random-LlamaForCausalLM has head_dim=4, so we create a tiny model with head_dim=16.
@@ -585,6 +718,7 @@ class TestUlyssesSPHFFlexAttention(DistributedTest):
             num_key_value_heads=2,
             vocab_size=32,
             max_position_embeddings=64,
+            use_cache=not packed,
         )  # head_dim = 32/2 = 16
         seq_length = 64
         sequence_parallel_size = self.world_size
@@ -621,7 +755,8 @@ class TestUlyssesSPHFFlexAttention(DistributedTest):
                         labels=input_ids.unsqueeze(0))
 
         input_ids = tensor([[1, 10, 10, 10, 2, 2], [1, 20, 20, 20, 2, 2]])
-        position_ids = tensor([[0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5]])
+        positions = [0, 1, 2, 3, 0, 1] if packed else [0, 1, 2, 3, 4, 5]
+        position_ids = tensor([positions, positions])
         ds = torch.utils.data.TensorDataset(input_ids, position_ids)
 
         # 1. Baseline: DataLoader calibration
@@ -630,7 +765,7 @@ class TestUlyssesSPHFFlexAttention(DistributedTest):
         #print(f"{rank=} {batch_a=}")
         expected_batch_a = {
             'input_ids': tensor([[1, 10, 10, 10, 2, 2]]),
-            'position_ids': tensor([[0, 1, 2, 3, 4, 5]]),
+            'position_ids': tensor([positions]),
             'labels': tensor([[1, 10, 10, 10, 2, 2]])
         }
         torch_assert_dicts_of_tensors_equal(batch_a, expected_batch_a)
@@ -690,7 +825,7 @@ class TestUlyssesSPHFFlexAttention(DistributedTest):
             },
             {
                 'input_ids': tensor([[10, 2, 2]]),
-                'position_ids': tensor([[3, 4, 5]]),
+                'position_ids': tensor([positions[3:]]),
                 'shift_labels': tensor([[2, 2, -100]]),
             },
         ]
