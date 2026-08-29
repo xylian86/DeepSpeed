@@ -14,9 +14,9 @@ import torch
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 
 MODEL_SIZES = {
-    "1B": 1 * 1024**3 // 4,
-    "2B": 2 * 1024**3 // 4,
-    "4B": 4 * 1024**3 // 4,
+    "1B": 1_000_000_000,
+    "2B": 2_000_000_000,
+    "4B": 4_000_000_000,
 }
 
 NUM_WARMUP = 3
