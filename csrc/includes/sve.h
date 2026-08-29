@@ -26,11 +26,11 @@ inline void writeAs(void* dst, const T& val)
 #define TILE 512  // Adjusted tile size to match L2 cache size
 
 // SVE SIMD macros with non-temporal access
-#define SIMD_WIDTH 1024 * 512
+#define SIMD_WIDTH 4
 #define VECTOR_UNROLL 4
 #define SIMD_PRED svptrue_pat_b32(SV_VL4)  // Predicate for exactly 4 elements
 #define SIMD_STORE(dst, src) svstnt1_f32(SIMD_PRED, dst, src)  // Non-temporal store
-#define SIMD_LOAD(x) svldnt1_f32(svptrue_b32(), x)  // Non-temporal load
+#define SIMD_LOAD(x) svldnt1_f32(SIMD_PRED, x)  // Non-temporal load
 #define SIMD_SET(x) svdup_n_f32(x)
 #define SIMD_ADD(x, y) svadd_f32_x(svptrue_b32(), x, y)
 #define SIMD_MUL(x, y) svmul_f32_x(SIMD_PRED, x, y)
@@ -39,7 +39,7 @@ inline void writeAs(void* dst, const T& val)
 #define SIMD_DIV(x, y) svdiv_f32_x(SIMD_PRED, x, y)
 
 // Non-temporal load/store macros
-#define SIMD_NT_LOAD(x) svldnt1_f32(svptrue_b32(), x)  // Non-temporal load
+#define SIMD_NT_LOAD(x) svldnt1_f32(SIMD_PRED, x)  // Non-temporal load
 #define SIMD_NT_STORE(dst, src) svstnt1_f32(SIMD_PRED, dst, src)  // Non-temporal store
 
 // Optimized SVE Data structure for 128-bit vectors
