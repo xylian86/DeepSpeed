@@ -318,6 +318,27 @@ shape/dtype template: both backends page-lock a fresh buffer and never read
 ``tensor``, so scratch destinations do not pay for a second full-size
 allocation and a copy.
 
+Empty scratch buffers should use ``pin_empty`` / ``pin_empty_like`` instead of
+``pin_memory(torch.empty(...), make_copy=False)``. Those helpers take a shape
+and dtype only, so neither backend allocates a full-size pageable template.
+
+.. code-block:: python
+
+    scratch = get_accelerator().pin_empty_like(src, device='cpu')
+    scratch = get_accelerator().pin_empty(1024, dtype=torch.float32, device='cpu')
+
+Pin on/off vs backend
+=====================
+
+Whether to pin and how to pin are orthogonal:
+
+* **On/off:** ``zero_optimization.offload_*.pin_memory`` (ZeRO CPU offload).
+* **How:** ``DS_PIN_MEMORY_BACKEND=torch|native`` (environment only; not a
+  ``ds_config`` field). Every call site that pins through
+  ``get_accelerator().pin_memory()`` honors this env var, including ZeRO
+  CPU-offload buffers and the NVMe swap buffers. ``native`` page-locks with
+  ``mlock`` and registers the buffer with the device runtime
+  (``cudaHostRegister`` on CUDA) unless ``DS_PIN_MEMORY_REGISTER_DEVICE=0``.
 Backend Selection
 =================
 
@@ -354,6 +375,9 @@ handles (so DeepNVMe can skip bounce buffers), and are counted by
    * - ``pin_memory`` extras
      - Honors ``make_copy`` and ``match_shape`` (both default ``True``)
      - Honors ``make_copy`` and ``match_shape`` (both default ``True``)
+   * - ``pin_empty`` / ``pin_empty_like``
+     - Host scratch allocation (cpu ``device``, required ``dtype``); no pageable template
+     - Same helper; native ``mlock`` via ``pin_empty``
    * - Pin recognition (``is_pinned``)
      - Torch pinned status (``tensor.is_pinned()``)
      - ``.ds_pinned`` and process-wide pointer ranges (slices/views included)
