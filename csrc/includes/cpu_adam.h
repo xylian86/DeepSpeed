@@ -55,7 +55,7 @@ public:
                   size_t param_size,
                   bool parallel = true);
 #endif
-#if defined(__ARM_FEATURE_SVE)
+#if defined(__SVE__) && defined(__ARM_FEATURE_SVE)
     template <int span, typename ds_params_precision_t, typename ds_state_precision_t>
     void Step_SVE(size_t* rounded_size,
                   ds_params_precision_t* _params,
@@ -213,7 +213,7 @@ void Adam_Optimizer::Step_AVX(size_t* rounded_size,
 }
 #endif
 
-#if defined(__ARM_FEATURE_SVE)
+#if defined(__SVE__) && defined(__ARM_FEATURE_SVE)
 template <int span, typename ds_params_precision_t, typename ds_state_precision_t>
 void Adam_Optimizer::Step_SVE(size_t* rounded_size,
                               ds_params_precision_t* _params,

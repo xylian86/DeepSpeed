@@ -6,7 +6,7 @@
 
 #include <cstddef>
 
-#if defined(__ARM_FEATURE_SVE)
+#if defined(__SVE__) && defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
 
 template <int span>

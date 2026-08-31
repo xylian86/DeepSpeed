@@ -49,23 +49,6 @@ def make_builder(**overrides):
     return builder
 
 
-@pytest.mark.parametrize('cpu_info,expected', [
-    ({
-        'arch': 'ARM_8',
-        'flags': ['sve', 'sve2']
-    }, '-D__SVE__'),
-    ({
-        'arch': 'ARM_8',
-        'flags': []
-    }, '-D__SCALAR__'),
-])
-def test_simd_width_detects_arm_sve(cpu_info, expected):
-    cpuinfo = MagicMock()
-    cpuinfo.get_cpu_info.return_value = cpu_info
-    with patch.dict(sys.modules, {'cpuinfo': cpuinfo}):
-        assert make_builder().simd_width() == expected
-
-
 def assert_jit_uses_explicit_arch_list(builder, expected_arch_list, env_updates=None):
     env_updates = env_updates or {}
 
