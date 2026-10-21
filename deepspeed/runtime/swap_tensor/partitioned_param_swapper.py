@@ -6,6 +6,7 @@
 Functionality of swapping tensors to/from (NVMe) storage devices.
 """
 
+import functools
 import os
 import shutil
 from enum import Enum
@@ -134,7 +135,7 @@ class AsyncPartitionedParameterSwapper(object):
         if self.use_gds:
             self.aio_read_handle.pin_device_tensor(self.buffers)
         else:
-            self.buffers = get_accelerator().pin_memory(self.buffers)
+            self.buffers = get_accelerator().pin_memory(self.buffers, make_copy=False)
 
         self.swap_out_params = []
 
@@ -152,7 +153,7 @@ class AsyncPartitionedParameterSwapper(object):
         cache = LookaheadDRAMCache(enabled=True,
                                    dtype=self.dtype,
                                    aio_handle=aio_read_handle,
-                                   pin_memory_fn=get_accelerator().pin_memory,
+                                   pin_memory_fn=functools.partial(get_accelerator().pin_memory, make_copy=False),
                                    aligned_numel_fn=self._io_aligned_numel,
                                    max_prefetches_per_call=max(1, self.aio_config[AIO_QUEUE_DEPTH]),
                                    max_inflight_prefetches=max(1, 2 * self.aio_config[AIO_QUEUE_DEPTH]))

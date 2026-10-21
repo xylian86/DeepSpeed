@@ -23,7 +23,7 @@ from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
 
 class _FakeAccelerator:
 
-    def pin_memory(self, tensor, align_bytes=0):
+    def pin_memory(self, tensor, make_copy=True, match_shape=True):
         return tensor
 
     def is_pinned(self, tensor):
@@ -450,7 +450,7 @@ def test_lookahead_dram_cache_prefetches_nearest_future_uses(monkeypatch):
     cache = LookaheadDRAMCache(enabled=True,
                                dtype=torch.float32,
                                aio_handle=aio_handle,
-                               pin_memory_fn=lambda tensor, align_bytes=0: tensor,
+                               pin_memory_fn=lambda tensor: tensor,
                                aligned_numel_fn=lambda numel: numel,
                                host_memory_limit_bytes_fn=lambda: 9,
                                host_memory_current_bytes_fn=lambda: 0,
@@ -476,7 +476,7 @@ def test_lookahead_dram_cache_divides_budget_across_local_ranks():
     cache = LookaheadDRAMCache(enabled=True,
                                dtype=torch.float32,
                                aio_handle=_FakeAIOHandle(),
-                               pin_memory_fn=lambda tensor, align_bytes=0: tensor,
+                               pin_memory_fn=lambda tensor: tensor,
                                aligned_numel_fn=lambda numel: numel,
                                host_memory_limit_bytes_fn=lambda: 100,
                                host_memory_current_bytes_fn=lambda: 0,
@@ -493,7 +493,7 @@ def test_lookahead_dram_cache_honors_global_cgroup_usage():
     cache = LookaheadDRAMCache(enabled=True,
                                dtype=torch.float32,
                                aio_handle=_FakeAIOHandle(),
-                               pin_memory_fn=lambda tensor, align_bytes=0: tensor,
+                               pin_memory_fn=lambda tensor: tensor,
                                aligned_numel_fn=lambda numel: numel,
                                host_memory_limit_bytes_fn=lambda: 100,
                                host_memory_current_bytes_fn=lambda: 85,
