@@ -497,6 +497,28 @@ class DeepSpeedSuperRLCacheConfig:
         return f"DeepSpeedSuperRLCacheConfig(enabled={self.enabled})"
 
 
+class DeepSpeedSuperRLPinConfig:
+
+    def __init__(self, enabled=False, arena=True):
+        self.enabled = enabled
+        self.arena = arena
+
+    def __repr__(self):
+        return f"DeepSpeedSuperRLPinConfig(enabled={self.enabled}, arena={self.arena})"
+
+
+def get_superrl_pin_config(param_dict):
+    # The pin backend itself is selected by DS_PIN_MEMORY_BACKEND; this config
+    # only decides whether phase-lived buffers come from a phase arena.
+    value = param_dict.get("superrl_pin", False)
+    if isinstance(value, bool):
+        return DeepSpeedSuperRLPinConfig(enabled=value)
+    if isinstance(value, dict):
+        return DeepSpeedSuperRLPinConfig(enabled=bool(value.get("enabled", False)),
+                                         arena=bool(value.get("arena", True)))
+    raise ValueError("DeepSpeedConfig: superrl_pin must be a boolean or an object with an enabled field")
+
+
 def get_superrl_cache_config(param_dict):
     value = param_dict.get("superrl_cache", False)
     if isinstance(value, bool):
@@ -978,6 +1000,7 @@ class DeepSpeedConfig(object):
 
         self.aio_config = get_aio_config(param_dict)
         self.superrl_cache_config = get_superrl_cache_config(param_dict)
+        self.superrl_pin_config = get_superrl_pin_config(param_dict)
         self.superrl_io_config = get_superrl_io_config(param_dict)
         self.superrl_sync_config = get_superrl_sync_config(param_dict)
         self.superrl_low_host_mem_config = get_superrl_low_host_mem_config(param_dict)

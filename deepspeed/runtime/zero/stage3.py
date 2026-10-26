@@ -194,6 +194,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         aio_config=None,
         superrl_io_config=None,
         superrl_low_host_mem_config=None,
+        superrl_pin_config=None,
         all2all_process_group=None,
         zero_hpz_partition_size=1,
         zero_quantized_weights=False,
@@ -329,6 +330,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.superrl_low_host_mem_config = superrl_low_host_mem_config
         self.superrl_low_host_mem_enabled = getattr(superrl_low_host_mem_config, "enabled", False)
         self.superrl_low_host_mem_grad_partitions = False
+        self.superrl_pin_config = superrl_pin_config
         self.superrl_io_config = superrl_io_config
         self.superrl_io_enabled = getattr(superrl_io_config, "enabled", False)
         self.superrl_io_active = self._resolve_superrl_io_active()
@@ -688,6 +690,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if self.superrl_low_host_mem_grad_partitions:
             if dist.get_rank() == 0:
                 logger.info("SuperRL low_host_mem enabled: using lazy ZeRO-3 gradient partition buffers")
+            self._init_superrl_grad_arena(all_params)
             return
 
         self.grad_partitions_flat_buffer: Tensor = torch.zeros(sum(p.partition_numel() for p in all_params),
@@ -1744,11 +1747,59 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         grad_buffer = self.__param_id_to_grad_partition.get(param.ds_id)
         if grad_buffer is None or grad_buffer.numel() != param.partition_numel():
-            grad_buffer = torch.zeros(param.partition_numel(),
-                                      dtype=self.gradient_accumulation_dtype,
-                                      device=self.device)
+            grad_buffer = self._new_superrl_grad_arena_buffer(param)
+            if grad_buffer is None:
+                grad_buffer = torch.zeros(param.partition_numel(),
+                                          dtype=self.gradient_accumulation_dtype,
+                                          device=self.device)
             self.__param_id_to_grad_partition[param.ds_id] = grad_buffer
         return grad_buffer.narrow(0, 0, grad_partition.numel())
+
+    def _init_superrl_grad_arena(self, all_params):
+        # SuperRL-Pin: lazy gradient partitions live from the first micro-step of
+        # an update to its accumulation boundary. Pin them as slices of one arena
+        # per update, so their copies are asynchronous, and unpin the arena once
+        # at the boundary instead of freeing pageable buffers one by one.
+        self._superrl_grad_arena = None
+        self._superrl_grad_arena_bytes = 0
+        pin_config = self.superrl_pin_config
+        if not (getattr(pin_config, "enabled", False) and getattr(pin_config, "arena", False)):
+            return
+        from deepspeed.runtime.swap_tensor.phase_pinned_arena import PhasePinnedArena, ARENA_ALIGNMENT_BYTES
+        try:
+            arena = PhasePinnedArena("grad_partitions")
+        except RuntimeError as e:
+            logger.warning_once(f"superrl_pin arena disabled for gradient partitions: {e}")
+            return
+        element_size = torch.tensor([], dtype=self.gradient_accumulation_dtype).element_size()
+        self._superrl_grad_arena_bytes = sum(
+            (p.partition_numel() * element_size + ARENA_ALIGNMENT_BYTES - 1) // ARENA_ALIGNMENT_BYTES *
+            ARENA_ALIGNMENT_BYTES for p in all_params)
+        self._superrl_grad_arena = arena
+        if dist.get_rank() == 0:
+            print(f"[superrl_pin] gradient partitions use a "
+                  f"{self._superrl_grad_arena_bytes / 2**30:.2f} GiB arena per update")
+
+    def _new_superrl_grad_arena_buffer(self, param):
+        arena = getattr(self, "_superrl_grad_arena", None)
+        if arena is None:
+            return None
+        if not arena.active:
+            # Pin a new arena only at the start of an update. A partition first
+            # touched after the boundary released the arena keeps the pageable path.
+            if self.micro_step_id != 0:
+                return None
+            arena.reserve(self._superrl_grad_arena_bytes)
+        buffer = arena.allocate(param.partition_numel(), self.gradient_accumulation_dtype)
+        if self.micro_step_id != 0:
+            # Micro-step 0 overwrites the buffer; later micro-steps accumulate into it.
+            buffer.zero_()
+        return buffer
+
+    def _release_superrl_grad_arena(self):
+        arena = getattr(self, "_superrl_grad_arena", None)
+        if arena is not None and arena.active:
+            arena.release()
 
     def _use_direct_grad_partition_buffer(self):
         return self._using_superrl_low_host_mem_grad_partitions() and self.micro_step_id == 0 and \
@@ -1756,7 +1807,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
     def _release_grad_partition_buffer(self, param):
         if self._using_superrl_low_host_mem_grad_partitions():
-            self.__param_id_to_grad_partition.pop(param.ds_id, None)
+            buffer = self.__param_id_to_grad_partition.pop(param.ds_id, None)
+            arena = getattr(self, "_superrl_grad_arena", None)
+            if buffer is not None and arena is not None and arena.owns(buffer):
+                arena.free(buffer)
+                if self.is_gradient_accumulation_boundary and not self.__param_id_to_grad_partition:
+                    self._release_superrl_grad_arena()
 
     def _track_lazy_grad_overflow(self, grad_buffer):
         if not self._using_superrl_low_host_mem_grad_partitions() or self.dtype != torch.float16:
@@ -2229,6 +2285,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.norm_for_param_grads = {}
         if self._using_superrl_low_host_mem_grad_partitions():
             self.__param_id_to_grad_partition.clear()
+            self._release_superrl_grad_arena()
 
     def _pre_step(self):
         self.micro_step_id = 0
