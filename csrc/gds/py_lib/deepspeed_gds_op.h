@@ -3,6 +3,7 @@
 
 // DeepSpeed Team
 
+#include <atomic>
 #include <cstdlib>
 #include <fstream>
 #include <memory>
@@ -17,6 +18,7 @@ struct gds_op_desc_t : io_op_desc_t {
     CUfileDescr_t _cf_descr;
     CUfileHandle_t _cf_handle;
     void* _base_ptr;
+    std::atomic<int64_t> _next_chunk;  // next byte offset to transfer when the op is chunked
 
     gds_op_desc_t(const bool read_op,
                   const torch::Tensor& buffer,
@@ -37,6 +39,8 @@ struct gds_op_desc_t : io_op_desc_t {
     void finish();
 
     void _report_error(const ssize_t return_code, const int error_num, const off_t offset);
+
+    void _transfer(const int64_t num_bytes, const int64_t file_offset, const int64_t buf_offset);
 
     static void add_buffer_to_registry(const torch::Tensor& buffer);
 

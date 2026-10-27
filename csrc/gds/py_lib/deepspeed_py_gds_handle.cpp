@@ -103,7 +103,15 @@ void deepspeed_gds_handle_t::_init_cuFile(const int block_size, const int queue_
     std::lock_guard<std::mutex> lock(deepspeed_gds_handle_t::s_cuFile_mutex);
     if (deepspeed_gds_handle_t::s_cuFile_init == 0) {
         std::string depthStr = std::to_string(queue_depth);
-        std::string threadsStr = std::to_string(_intra_gds_op_parallelism);
+        // cuFile's own worker pool (one per process, sized by the first handle unless overridden) splits calls
+        // of at least min_io_threshold_size_kb when parallel_io is on.
+        const char* ioThreadsEnv = std::getenv("DEEPSPEED_GDS_MAX_IO_THREADS");
+        const char* parallelIoEnv = std::getenv("DEEPSPEED_GDS_PARALLEL_IO");
+        std::string threadsStr = ioThreadsEnv != nullptr
+                                     ? std::string(ioThreadsEnv)
+                                     : std::to_string(_intra_gds_op_parallelism);
+        std::string parallelIo =
+            parallelIoEnv != nullptr && std::string(parallelIoEnv) == "0" ? "false" : "true";
         const char* pinnedMemEnv = std::getenv("DEEPSPEED_GDS_MAX_DEVICE_PINNED_MEM_KB");
         const char* cacheMemEnv = std::getenv("DEEPSPEED_GDS_MAX_DEVICE_CACHE_KB");
         std::string pinnedMemKb = pinnedMemEnv != nullptr ? std::string(pinnedMemEnv) : "134217728";
@@ -111,7 +119,8 @@ void deepspeed_gds_handle_t::_init_cuFile(const int block_size, const int queue_
         std::string json1 = R"({"execution": {"max_io_queue_depth": )" + depthStr + ", ";
         std::string json2 = R"("max_request_parallelism": )" + threadsStr + ", ";
         std::string json3 = R"("max_io_threads": )" + threadsStr + ", ";
-        std::string json4 = R"("parallel_io": true, "min_io_threshold_size_kb": 8192}, )";
+        std::string json4 =
+            R"("parallel_io": )" + parallelIo + R"(, "min_io_threshold_size_kb": 8192}, )";
         std::string json5 = R"("properties": {"max_device_cache_size_kb": )" + cacheMemKb + ", ";
         std::string json6 = R"("per_buffer_cache_size_kb": 1024, "max_device_pinned_mem_size_kb": )" + pinnedMemKb + ", ";
         std::string json7 = R"("allow_compat_mode": false, "use_poll_mode": false}})";
@@ -137,7 +146,10 @@ void deepspeed_gds_handle_t::_init_cuFile(const int block_size, const int queue_
                                  deepspeed_gds_handle_t::s_had_previous_cuFile_config_path);
             throw std::runtime_error(std::string("cuFileDriverOpen failed: ") + cuFileGetErrorString(status));
         }
-        size_t direct_io_size = (size_t)block_size / 1024;
+        // Largest single direct IO cuFile issues, in KiB (DEEPSPEED_GDS_MAX_DIRECT_IO_KB, else the block size).
+        const char* directIoEnv = std::getenv("DEEPSPEED_GDS_MAX_DIRECT_IO_KB");
+        size_t direct_io_size = directIoEnv != nullptr ? (size_t)std::strtoull(directIoEnv, nullptr, 10)
+                                                       : (size_t)block_size / 1024;
         status = cuFileDriverSetMaxDirectIOSize(direct_io_size);
         if (status.err != CU_FILE_SUCCESS) {
             cuFileDriverClose();

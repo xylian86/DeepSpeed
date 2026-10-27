@@ -16,6 +16,7 @@ from deepspeed.runtime.swap_tensor.utils import swap_in_tensors, swap_out_tensor
     SwapBufferManager, get_swap_io_handle_factory, verify_completed_device_writes
 from deepspeed.runtime.swap_tensor.async_swapper import AsyncTensorSwapper
 from deepspeed.runtime.swap_tensor.optimizer_utils import OPTIMIZER_SWAP_STAGING_BUFFER_COUNT, OptimizerSwapper
+from deepspeed.runtime.swap_tensor.superrl_io import apply_superrl_io_gds_env_defaults
 from deepspeed.accelerator import get_accelerator
 from deepspeed.ops.op_builder import AsyncIOBuilder, GDSBuilder
 
@@ -442,10 +443,12 @@ class SuperRLPipelinedGDSOptimizerSwapper(PipelinedOptimizerSwapper):
         write_parallelism = self._gds_parallelism(swap_config, aio_config, 'gds_write_intra_op_parallelism')
         prefetch_depth = max(1, int(getattr(swap_config, 'gds_prefetch_depth', 1)))
 
+        apply_superrl_io_gds_env_defaults()
         gds_op = GDSBuilder().load(verbose=False)
         # cuFile driver configuration is process-global and initialized by the
-        # first GDS handle. Keep that global cuFile setting write-friendly;
-        # the read handle below still owns its larger worker pool.
+        # first GDS handle, so the write handle below sets it. cuFile's own
+        # worker pool is off by default (SUPERRL_IO_GDS_ENV_DEFAULTS); each
+        # handle's threads issue the IO themselves.
         self.write_aio_handle = gds_op.gds_handle(block_size=aio_config[AIO_BLOCK_SIZE],
                                                   queue_depth=aio_config[AIO_QUEUE_DEPTH],
                                                   single_submit=aio_config[AIO_SINGLE_SUBMIT],

@@ -102,6 +102,7 @@ gds_op_desc_t::gds_op_desc_t(const bool read_op,
     const int64_t device = _buffer.get_device();
     check_cudaruntimecall(cudaSetDevice(device));
     _base_ptr = _find_base_ptr(device, (char*)_contiguous_buffer.data_ptr());
+    _next_chunk = 0;
 
     _safe_handle_register(fd, _cf_descr, _cf_handle);
 }
@@ -119,24 +120,48 @@ void gds_op_desc_t::validate()
         _read_op, _filename.c_str(), (char*)(cpu_buffer.data_ptr()), num_io_bytes);
 }
 
+// Bytes per cuFileRead/cuFileWrite call (DEEPSPEED_GDS_IO_CHUNK_KB; 0, the default, keeps one call per thread).
+// Without it each thread moves a fixed 1/intra_op_parallelism slice of the op in one call, so the op ends when the
+// slowest slice does. With it the threads take chunks of the op in turn until none are left.
+static int64_t _io_chunk_bytes()
+{
+    static const int64_t bytes = [] {
+        const char* env = std::getenv("DEEPSPEED_GDS_IO_CHUNK_KB");
+        return env != nullptr ? std::atoll(env) * 1024 : int64_t(0);
+    }();
+    return bytes;
+}
+
 void gds_op_desc_t::run(const int tid,
                         std::unique_ptr<aio_context>& aio_ctxt,
                         deepspeed_aio_config_t* aio_config)
 {
     assert(tid < _intra_op_parallelism);
     check_cudaruntimecall(cudaSetDevice(_buffer.get_device()));
-    const auto buf_offset = data_ptr() + (_num_bytes_per_thread * tid) - (char*)_base_ptr;
-    const auto tid_file_offset = _file_offset + (_num_bytes_per_thread * tid);
+    const auto base_offset = data_ptr() - (char*)_base_ptr;
+    const auto chunk = _io_chunk_bytes();
 
-    if (_read_op) {
-        auto ret =
-            cuFileRead(_cf_handle, _base_ptr, _num_bytes_per_thread, tid_file_offset, buf_offset);
-        if (ret < 0) { _report_error(ret, errno, tid_file_offset); }
-    } else {
-        auto ret =
-            cuFileWrite(_cf_handle, _base_ptr, _num_bytes_per_thread, tid_file_offset, buf_offset);
-        if (ret < 0) { _report_error(ret, errno, tid_file_offset); }
+    if (chunk <= 0) {
+        _transfer(_num_bytes_per_thread,
+                  _file_offset + (_num_bytes_per_thread * tid),
+                  base_offset + (_num_bytes_per_thread * tid));
+        return;
     }
+    const auto num_bytes = _num_bytes_per_thread * _intra_op_parallelism;
+    for (auto start = _next_chunk.fetch_add(chunk); start < num_bytes;
+         start = _next_chunk.fetch_add(chunk)) {
+        _transfer(std::min(chunk, num_bytes - start), _file_offset + start, base_offset + start);
+    }
+}
+
+void gds_op_desc_t::_transfer(const int64_t num_bytes,
+                              const int64_t file_offset,
+                              const int64_t buf_offset)
+{
+    const auto ret = _read_op
+                         ? cuFileRead(_cf_handle, _base_ptr, num_bytes, file_offset, buf_offset)
+                         : cuFileWrite(_cf_handle, _base_ptr, num_bytes, file_offset, buf_offset);
+    if (ret < 0) { _report_error(ret, errno, file_offset); }
 }
 
 void gds_op_desc_t::_report_error(const ssize_t return_code,

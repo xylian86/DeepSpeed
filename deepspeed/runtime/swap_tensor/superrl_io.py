@@ -26,6 +26,22 @@ SUPERRL_IO_MIN_OPTIMIZER_BUFFER_COUNT = 16
 SUPERRL_IO_SYNC_MIN_OPTIMIZER_BUFFER_COUNT = 5
 SUPERRL_IO_BUFFERS_PER_PREFETCH = 4
 
+# cuFile settings for the SuperRL-IO GDS handles. cuFile reads its config once per process, at the first handle, so
+# these must be in the environment before then; values already set win. Each handle thread moves its share of an op
+# as 16 MiB cuFile calls, taking chunks in turn, and cuFile's own worker pool is off: that pool is sized by the first
+# handle (the write handle) and throttles a larger read handle. On galleon (Qwen3-14B C3 IO pattern, 8 read threads)
+# reads went from 12.1 to 16.9 GiB/s on rank 0 and from 13.6 to 19.8 on rank 1; writes were unchanged.
+SUPERRL_IO_GDS_ENV_DEFAULTS = {
+    "DEEPSPEED_GDS_IO_CHUNK_KB": "16384",
+    "DEEPSPEED_GDS_MAX_DIRECT_IO_KB": "16384",
+    "DEEPSPEED_GDS_PARALLEL_IO": "0",
+}
+
+
+def apply_superrl_io_gds_env_defaults():
+    for key, value in SUPERRL_IO_GDS_ENV_DEFAULTS.items():
+        os.environ.setdefault(key, value)
+
 
 @dataclass(frozen=True)
 class GDSProbeResult:
