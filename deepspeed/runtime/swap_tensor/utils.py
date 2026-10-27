@@ -185,15 +185,64 @@ def swap_in_tensors(swap_handle, tensor_buffers, swap_paths, swap_offsets=None):
     return len(requests)
 
 
+# GDS (cuFile) reads device memory outside CUDA stream order: a write issued right after the copy or kernel that
+# fills its buffer can store the buffer's old contents. SUPERRL_GDS_WRITE_SYNC=0 restores the unsynchronized writes
+# (only to measure the race).
+_GDS_WRITE_SYNC = os.environ.get("SUPERRL_GDS_WRITE_SYNC", "1") != "0"
+# SUPERRL_VERIFY_GDS_WRITES=1: after each wait for device-buffer writes, read the written ranges back and count bytes
+# that differ from the buffers (synchronized first), i.e. what was written before its data was ready.
+_VERIFY_GDS_WRITES = os.environ.get("SUPERRL_VERIFY_GDS_WRITES") == "1"
+_pending_device_writes = {}  # id(handle) -> [(buffer, path, offset)]
+_verify_reader = None
+_verify_buffer = None  # registered device buffer that reads land in (GDS needs registered buffers)
+_verify_chunk_numel = 1 << 28  # bytes read back per sync_pread
+
+
 def swap_out_tensors(swap_handle, tensor_buffers, swap_paths, swap_offsets=None):
     if swap_offsets is None:
         swap_offsets = [0] * len(tensor_buffers)
     assert len(tensor_buffers) == len(swap_paths)
     assert len(tensor_buffers) == len(swap_offsets)
     requests = _coalesce_io_buffers(tensor_buffers, swap_paths, swap_offsets)
+    device_buffers = any(request.buffer.is_cuda for request in requests)
+    if device_buffers and _GDS_WRITE_SYNC:
+        get_accelerator().synchronize()
+    if device_buffers and _VERIFY_GDS_WRITES:
+        _pending_device_writes.setdefault(id(swap_handle), []).extend(
+            (request.buffer, request.path, request.offset) for request in requests)
     for request in requests:
         assert (swap_handle.async_pwrite(request.buffer, request.path, request.offset) == 0)
     return len(requests)
+
+
+def verify_completed_device_writes(swap_handle, what):
+    """With SUPERRL_VERIFY_GDS_WRITES=1, check the device-buffer writes that swap_handle.wait() just completed."""
+    pending = _pending_device_writes.pop(id(swap_handle), None)
+    if not pending:
+        return
+    global _verify_reader, _verify_buffer
+    if _verify_reader is None:
+        from deepspeed.ops.op_builder import GDSBuilder
+        _verify_reader = GDSBuilder().load(verbose=False).gds_handle(1 << 20, 16, False, True, 2)
+        _verify_buffer = torch.empty(_verify_chunk_numel, dtype=torch.uint8, device=get_accelerator().current_device_name())
+        _verify_reader.pin_device_tensor(_verify_buffer)
+    get_accelerator().synchronize()  # the buffers now hold what the writes should have stored
+    checked = stale = stale_writes = 0
+    for buffer, path, offset in pending:
+        flat = torch.as_strided(buffer, (buffer.numel(), ), (1, )).view(torch.uint8)
+        bad = 0
+        for start in range(0, flat.numel(), _verify_chunk_numel):
+            chunk = flat[start:start + _verify_chunk_numel]
+            back = _verify_buffer[:chunk.numel()]
+            assert _verify_reader.sync_pread(back, path, offset + start) == 1
+            bad += int((back != chunk).sum().item())
+        checked += flat.numel()
+        stale += bad
+        stale_writes += bad > 0
+    print(f"[superrl_verify] rank {dist.get_rank()} {what}: {len(pending)} writes, {checked / 2**30:.2f} GiB checked, "
+          f"{stale / 2**20:.1f} MiB differ ({stale_writes} writes affected; write sync "
+          f"{'on' if _GDS_WRITE_SYNC else 'OFF'})",
+          flush=True)
 
 
 def print_object(obj, name, exclude_list=[]):

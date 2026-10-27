@@ -13,7 +13,7 @@ import torch
 
 from deepspeed.runtime.swap_tensor.constants import *
 from deepspeed.runtime.swap_tensor.utils import swap_in_tensors, swap_out_tensors, print_object, print_rank_0, \
-    SwapBufferManager, get_swap_io_handle_factory
+    SwapBufferManager, get_swap_io_handle_factory, verify_completed_device_writes
 from deepspeed.runtime.swap_tensor.async_swapper import AsyncTensorSwapper
 from deepspeed.runtime.swap_tensor.optimizer_utils import OPTIMIZER_SWAP_STAGING_BUFFER_COUNT, OptimizerSwapper
 from deepspeed.accelerator import get_accelerator
@@ -39,6 +39,8 @@ class OptimizerSwapOp(object):
         assert self.wait_required
         assert self.aio_handle.wait() == self.num_ops
         self.wait_required = False
+        if not self.read_op:
+            verify_completed_device_writes(self.aio_handle, "optimizer state swap-out")
 
     def release_buffers(self):
         for lease in self.take_buffer_leases():

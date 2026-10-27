@@ -9,7 +9,8 @@ import torch
 
 from deepspeed import comm as dist
 from deepspeed.utils.logging import logger
-from deepspeed.runtime.swap_tensor.utils import is_direct_io_buffer, swap_out_tensors, SwapBuffer
+from deepspeed.runtime.swap_tensor.utils import is_direct_io_buffer, swap_out_tensors, SwapBuffer, \
+    verify_completed_device_writes
 
 INVALID_BUFFER_INDEX = -1
 ASYNC_SWAPPER_WAIT_TIMER = 'async_swap_gradient_wait'
@@ -146,6 +147,7 @@ class AsyncTensorSwapper(object):
         assert self.aio_handle.wait() == self.num_pending_swaps
         self._stop_timer(ASYNC_SWAPPER_WAIT_TIMER)
         self.timer_names.add(ASYNC_SWAPPER_WAIT_TIMER)
+        verify_completed_device_writes(self.aio_handle, "gradient swap-out")
 
         self.num_pending_swaps = 0
 
