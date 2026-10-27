@@ -17,10 +17,21 @@ pin it in a background thread; only the registration itself blocks the main
 thread's CUDA calls (about 4 ms per GiB). Chunks are unmapped in a background
 thread. Such chunks are not in DeepNVMe's pinned-tensor table, so use it only
 for buffers that never go to NVMe.
+
+A registered arena can also bind its chunks to one NUMA node, by default the
+node of the CPUs this process runs on (``numa_node="local"``). With
+zone_reclaim_mode 0 the kernel otherwise places pages on another node instead
+of reclaiming page cache on the local one; with the binding it reclaims. The
+binding is skipped, with a warning, if the node's free memory plus file pages
+cannot hold the chunk.
 """
 
+import collections
 import ctypes
+import glob
 import mmap
+import os
+import platform
 import threading
 import time
 
@@ -43,10 +54,71 @@ _libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_
 _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 
 
-def _map_registered(nbytes):
+_SYSCALLS = {"aarch64": {"mbind": 235, "get_mempolicy": 236}, "x86_64": {"mbind": 237, "get_mempolicy": 239}}
+_MPOL_BIND = 2
+_MPOL_F_NODE_ADDR = 3  # MPOL_F_NODE | MPOL_F_ADDR
+_NODE_MASK_BITS = 1024
+_BIND_MARGIN_BYTES = 8 << 30
+
+
+def local_numa_node():
+    """The NUMA node of the first CPU this process may run on, or None."""
+    cpu = min(os.sched_getaffinity(0))
+    for path in glob.glob("/sys/devices/system/node/node[0-9]*/cpulist"):
+        for part in open(path).read().strip().split(","):
+            if part:
+                lo, _, hi = part.partition("-")
+                if int(lo) <= cpu <= int(hi or lo):
+                    return int(path.split("/")[-2][4:])
+    return None
+
+
+def _node_reclaimable_bytes(node):
+    """Free memory plus file pages on ``node``: what a bound allocation can get by reclaiming page cache."""
+    fields = {}
+    for line in open(f"/sys/devices/system/node/node{node}/meminfo"):
+        parts = line.split()
+        fields[parts[2].rstrip(":")] = int(parts[3]) * 1024
+    return fields["MemFree"] + fields.get("Active(file)", 0) + fields.get("Inactive(file)", 0)
+
+
+def _syscall(name, *args):
+    number = _SYSCALLS.get(platform.machine(), {}).get(name)
+    if number is None:
+        raise OSError(f"no {name} syscall number for {platform.machine()}")
+    if _libc.syscall(number, *args) != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, f"{name}: {os.strerror(errno)}")
+
+
+def _bind_range(addr, nbytes, node):
+    mask = (ctypes.c_ulong * (_NODE_MASK_BITS // 64))()
+    mask[node // 64] = 1 << (node % 64)
+    _syscall("mbind", ctypes.c_void_p(addr), ctypes.c_ulong(nbytes), ctypes.c_int(_MPOL_BIND), mask,
+             ctypes.c_ulong(_NODE_MASK_BITS + 1), ctypes.c_uint(0))
+
+
+def _sample_nodes(addr, nbytes, samples=64):
+    """Count the NUMA nodes of ``samples`` evenly spaced (faulted-in) pages of a range."""
+    counts = collections.Counter()
+    node = ctypes.c_int()
+    for i in range(samples):
+        page = addr + (nbytes - 1) * i // max(samples - 1, 1)
+        try:
+            _syscall("get_mempolicy", ctypes.byref(node), None, ctypes.c_ulong(0), ctypes.c_void_p(page),
+                     ctypes.c_ulong(_MPOL_F_NODE_ADDR))
+            counts[node.value] += 1
+        except OSError:
+            counts["?"] += 1
+    return counts
+
+
+def _map_registered(nbytes, node):
     addr = _libc.mmap(None, nbytes, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS, -1, 0)
     if addr is None or addr == ctypes.c_void_p(-1).value:
         raise OSError(ctypes.get_errno(), f"mmap of {nbytes} bytes failed")
+    if node is not None:
+        _bind_range(addr, nbytes, node)
     tensor = torch.frombuffer((ctypes.c_uint8 * nbytes).from_address(addr), dtype=torch.uint8)
     tensor.fill_(0)  # fault the pages in on the intra-op threads; ctypes calls and torch ops drop the GIL
     get_accelerator().register_host_memory(addr, nbytes)
@@ -80,11 +152,14 @@ class PhasePinnedArena:
     freed.
     """
 
-    def __init__(self, name, chunk_bytes=1 << 30, alignment=ARENA_ALIGNMENT_BYTES, registered=False):
+    def __init__(self, name, chunk_bytes=1 << 30, alignment=ARENA_ALIGNMENT_BYTES, registered=False, numa_node=None):
         self.name = name
         self.chunk_bytes = chunk_bytes
         self.alignment = alignment
         self.registered = registered
+        self.numa_node = local_numa_node() if numa_node == "local" else numa_node
+        self.phase_placement = collections.Counter()  # sampled pages per NUMA node in this phase's chunks
+        self.phase_unbound_chunks = 0
         self._native = get_active_native_pinned_memory()
         if self._native is None and not registered:
             raise RuntimeError("PhasePinnedArena requires DS_PIN_MEMORY_BACKEND=native")
@@ -149,7 +224,14 @@ class PhasePinnedArena:
     def _pin_chunk(self, nbytes):
         start = time.perf_counter()
         if self.registered:
-            tensor = _map_registered(nbytes)
+            node = self.numa_node
+            if node is not None and _node_reclaimable_bytes(node) < nbytes + _BIND_MARGIN_BYTES:
+                print_rank_0(f"[superrl_pin] {self.name} arena: node {node} cannot hold a "
+                             f"{nbytes / 2**30:.2f} GiB chunk; not binding it", force=True)
+                node = None
+                self.phase_unbound_chunks += 1
+            tensor = _map_registered(nbytes, node)
+            self.phase_placement.update(_sample_nodes(tensor.data_ptr(), nbytes))
         else:
             tensor = self._native.pin_empty(torch.empty(0, dtype=torch.uint8), (nbytes, ))
         self.phase_pin_seconds += time.perf_counter() - start
@@ -220,10 +302,18 @@ class PhasePinnedArena:
         self.last_pin_seconds = self.phase_pin_seconds
         self.phase_pin_seconds = 0.0
         wait, self.last_wait_seconds = self.last_wait_seconds, 0.0
+        placement = ""
+        if self.registered:
+            total = max(sum(self.phase_placement.values()), 1)
+            nodes = ", ".join(f"node {n} {c / total:.0%}" for n, c in sorted(self.phase_placement.items(), key=str))
+            placement = (f" (bound to node {self.numa_node}; sampled pages: {nodes}; "
+                         f"{self.phase_unbound_chunks} chunk(s) not bound)")
+            self.phase_placement.clear()
+            self.phase_unbound_chunks = 0
         self.phases += 1
         print_rank_0(f"[superrl_pin] {self.name} arena phase {self.phases}: "
                      f"{self.last_phase_bytes / 2**30:.2f} GiB pinned in {self.last_pin_seconds:.3f} s "
-                     f"(waited {wait:.3f} s for background pinning), "
+                     f"(waited {wait:.3f} s for background pinning){placement}, "
                      f"unpinned in {self.last_unpin_seconds:.3f} s, "
                      f"{len(self._closing)} chunk(s) still held by live slices",
                      force=True)
