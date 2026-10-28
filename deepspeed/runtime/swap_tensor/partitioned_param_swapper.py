@@ -137,6 +137,11 @@ class AsyncPartitionedParameterSwapper(object):
         else:
             self.buffers = get_accelerator().pin_memory(self.buffers, make_copy=False)
 
+        # GDS moves data outside CUDA stream order, and Work.wait() on an all-gather only orders streams: a read into a
+        # buffer that was just released can overwrite it while the released partition's all-gather still reads it on
+        # the GPU. Each released device buffer records an event on the current stream; the next user waits for it.
+        self.buffer_release_events = {}
+
         self.swap_out_params = []
 
     def _configure_lookahead_cache(self, ds_config):
@@ -308,7 +313,7 @@ class AsyncPartitionedParameterSwapper(object):
             assert param_id not in self.param_id_to_swap_buffer.keys(
             ), f"param {param_id} has already been assigned a swap buffer"
 
-            buffer_id = self.available_buffer_ids.pop()
+            buffer_id = self._take_buffer_id()
             print_rank_0(f"param {param.ds_id} is assigned swap in buffer id {buffer_id}  ")
             self.param_id_to_buffer_id[param_id] = buffer_id
             aligned_swap_numel = self._io_aligned_numel(self.param_id_to_numel[param_id])
@@ -364,6 +369,10 @@ class AsyncPartitionedParameterSwapper(object):
                 assert buffer_id is not None, "Missing buffer id for releasing"
 
                 self.available_buffer_ids.append(buffer_id)
+                if self.use_gds:
+                    event = get_accelerator().Event()
+                    event.record()
+                    self.buffer_release_events[buffer_id] = event
                 del self.param_id_to_buffer_id[param_id]
                 del self.param_id_to_swap_buffer[param_id]
                 print_rank_0(f"param {param.ds_id} releases buffer id {buffer_id}  ")
@@ -497,7 +506,7 @@ class AsyncPartitionedParameterSwapper(object):
         assert numel <= self.elements_per_buffer, f"More elements {numel} than buffer size {self.elements_per_buffer}"
 
         self.param_id_to_numel[param_id] = numel
-        buffer_id = self.available_buffer_ids.pop()
+        buffer_id = self._take_buffer_id()
         self.param_id_to_buffer_id[param_id] = buffer_id
         aligned_swap_numel = self._io_aligned_numel(self.param_id_to_numel[param_id])
         swap_buffer = self.buffers.narrow(0, int(buffer_id * self.aligned_elements_per_buffer), aligned_swap_numel)
@@ -507,7 +516,17 @@ class AsyncPartitionedParameterSwapper(object):
         print_rank_0(f"param {param.ds_id} is assigned swap in buffer id {buffer_id}")
         return compute_buffer
 
+    def _take_buffer_id(self):
+        buffer_id = self.available_buffer_ids.pop()
+        event = self.buffer_release_events.pop(buffer_id, None)
+        if event is not None:
+            event.synchronize()
+        return buffer_id
+
     def reserve_available_buffers(self):
+        for event in self.buffer_release_events.values():
+            event.synchronize()
+        self.buffer_release_events.clear()
         buffers = []
         for id in self.available_buffer_ids:
             buffers.append(
