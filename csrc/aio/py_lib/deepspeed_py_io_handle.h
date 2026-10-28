@@ -82,6 +82,8 @@ struct deepspeed_io_handle_t {
 
     int wait();
 
+    int wait_some(const int num_ops);
+
     void _stop_threads();
 
     void _schedule_aio_work_locked(std::shared_ptr<struct io_op_desc_t> scheduled_op);
@@ -89,6 +91,8 @@ struct deepspeed_io_handle_t {
     std::shared_ptr<struct io_op_desc_t> _wait_for_aio_work();
 
     int _wait_locked();
+
+    int _wait_locked(const int num_ops);
 
     bool _is_valid_parallel_aio_op(const bool read_op, const int64_t num_bytes);
 

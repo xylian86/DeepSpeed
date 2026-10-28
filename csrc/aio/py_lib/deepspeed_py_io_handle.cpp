@@ -206,12 +206,26 @@ int deepspeed_io_handle_t::wait()
     return _wait_locked();
 }
 
+// Every thread runs the ops in submission order, and one completion from each thread finishes the oldest pending
+// op, so this waits for the oldest num_ops ops only: the caller can use the first reads of a batch while the later
+// ones are still in flight.
+int deepspeed_io_handle_t::wait_some(const int num_ops)
+{
+    std::lock_guard<std::mutex> lock(_handle_mutex);
+    return _wait_locked(num_ops);
+}
+
 int deepspeed_io_handle_t::_wait_locked()
 {
     assert(_num_pending_ops > 0);
+    return _wait_locked(_num_pending_ops);
+}
+
+int deepspeed_io_handle_t::_wait_locked(const int num_ops)
+{
     auto num_completed_ops = 0;
 
-    while (_num_pending_ops > 0) {
+    while (_num_pending_ops > 0 && num_completed_ops < num_ops) {
         auto completed_op = _wait_for_aio_work();
 
         if (completed_op->_validate) { completed_op->validate(); }
