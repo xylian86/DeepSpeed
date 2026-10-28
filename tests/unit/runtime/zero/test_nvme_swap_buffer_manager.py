@@ -350,6 +350,7 @@ def test_swap_buffer_pool_waits_on_coalesced_request_count(monkeypatch):
 
 
 def test_optimizer_swap_info_allocates_container_offsets():
+    block = optimizer_swap_utils.SWAP_FILE_OFFSET_ALIGNMENT
     allocator = OptimizerSwapFileAllocator(path="optimizer_state_and_gradient.swp",
                                            element_size=torch.tensor([], dtype=torch.float32).element_size(),
                                            numel_alignment=8)
@@ -362,12 +363,23 @@ def test_optimizer_swap_info_allocates_container_offsets():
     swap_info.add_state_tensors([state])
 
     assert swap_info.get_swap_paths() == ["optimizer_state_and_gradient.swp"] * 2
-    assert swap_info.get_swap_offsets() == [0, 64]
+    assert swap_info.get_swap_offsets() == [0, block]
 
     gradient_paths, gradient_offsets = swap_info.get_or_create_gradient_paths_and_offsets(offsets=[0, 8],
                                                                                           lengths=[3, 9])
     assert gradient_paths == ["optimizer_state_and_gradient.swp"] * 2
-    assert gradient_offsets == [128, 160]
+    assert gradient_offsets == [2 * block, 3 * block]
+
+
+def test_swap_file_allocator_starts_tensors_on_blocks():
+    block = optimizer_swap_utils.SWAP_FILE_OFFSET_ALIGNMENT
+    allocator = OptimizerSwapFileAllocator(path="container.swp", element_size=4, numel_alignment=256)
+
+    # 3 blocks of fp32 stay back to back; 10 KiB (a 1 KiB multiple) is rounded up to 3 blocks.
+    offsets = [allocator.allocate(numel)[1] for numel in (3 * block // 4, 2560, 256)]
+
+    assert offsets == [0, 3 * block, 6 * block]
+    assert allocator.next_file_offset == 7 * block
 
 
 def test_optimizer_swap_info_binds_lazy_direct_buffers(monkeypatch):

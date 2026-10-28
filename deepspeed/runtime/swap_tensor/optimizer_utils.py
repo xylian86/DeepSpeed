@@ -19,6 +19,11 @@ from deepspeed.runtime.swap_tensor.utils import SwapBufferManager, SwapBufferPoo
 
 OPTIMIZER_SWAP_STAGING_BUFFER_COUNT = 4
 
+# Every tensor in the swap container starts on a 4 KiB block. The container packs tensors back to back, and when their
+# sizes are only 1 KiB multiples (sub-groups with norm weights between the matrices) most offsets land inside a block.
+# GDS writes to such offsets ran at 8.2 GiB/s instead of 10.3 (Qwen3-14B PPO state on galleon's md RAID0).
+SWAP_FILE_OFFSET_ALIGNMENT = 4096
+
 
 def split_swap_buffer_counts(swap_config):
     if not getattr(swap_config, 'pipeline', False):
@@ -55,7 +60,9 @@ class OptimizerSwapFileAllocator(object):
 
     def allocate(self, numel):
         file_offset = self.next_file_offset
-        self.next_file_offset += self._aligned_numel(numel) * self.element_size
+        nbytes = self._aligned_numel(numel) * self.element_size
+        remainder = nbytes % SWAP_FILE_OFFSET_ALIGNMENT
+        self.next_file_offset += nbytes if remainder == 0 else (nbytes + SWAP_FILE_OFFSET_ALIGNMENT - remainder)
         return self.path, file_offset
 
 
