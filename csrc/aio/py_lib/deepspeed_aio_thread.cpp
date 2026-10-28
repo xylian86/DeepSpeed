@@ -39,9 +39,11 @@ void deepspeed_aio_thread_t::run()
         if (next_io_op) {
             next_io_op->run(_tid, _aio_ctxt, &_aio_config);
 
+            // Hand this thread's reference to the waiter, so the op is always freed by the waiting thread: freeing
+            // it can take the GIL (a buffer whose Python object died during the I/O is owned by the tensor).
             {
                 std::lock_guard<std::mutex> lock(_complete_sync._mutex);
-                _complete_queue.push(next_io_op);
+                _complete_queue.push(std::move(next_io_op));
             }
             _complete_sync._cond_var.notify_one();
         }
