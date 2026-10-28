@@ -17,6 +17,7 @@ from .constants import *
 from .utils import swap_in_tensors, swap_out_tensors, MIN_AIO_BYTES, AIO_ALIGNED_BYTES, print_object, SwapBufferPool, \
     get_swap_io_handle_factory
 from .lookahead_dram_cache import LookaheadDRAMCache
+from .superrl_io import apply_superrl_io_gds_env_defaults
 from deepspeed.runtime.zero.offload_config import resolve_nvme_path
 
 
@@ -99,6 +100,11 @@ class AsyncPartitionedParameterSwapper(object):
         self.aio_config = ds_config.aio_config
 
         self.use_gds = self.aio_config[AIO_USE_GDS]
+        if self.use_gds and getattr(getattr(ds_config, "superrl_io_config", None), "enabled", False):
+            # cuFile reads its config at the process's first GDS handle and the chunk size at its first op. With the
+            # parameters on NVMe those are this swapper's, created before the optimizer swapper that sets the
+            # SuperRL-IO defaults, so set them here too.
+            apply_superrl_io_gds_env_defaults()
         self.aio_handle = get_swap_io_handle_factory(self.aio_config, use_gds=self.use_gds, verbose=False)
 
         # Read/Write alignment for each thread during Intra-request parallelism
