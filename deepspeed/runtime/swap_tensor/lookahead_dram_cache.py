@@ -17,6 +17,9 @@ from deepspeed.runtime.swap_tensor.utils import swap_in_tensors
 
 
 HOST_MEMORY_CAP_FRACTION = 0.9
+# SUPERRL_CACHE_MAX_GIB caps each rank's cache. The default envelope counts all physical pages, which on GH200
+# include both GPUs' HBM NUMA nodes, and it misses a cgroup limit set below the root.
+CACHE_MAX_GIB_ENV = "SUPERRL_CACHE_MAX_GIB"
 
 
 def _read_int(path):
@@ -181,7 +184,9 @@ class LookaheadDRAMCache:
 
     @property
     def memory_cap_bytes(self):
-        return self.global_memory_cap_bytes // self.local_world_size
+        cap = self.global_memory_cap_bytes // self.local_world_size
+        max_gib = os.environ.get(CACHE_MAX_GIB_ENV)
+        return cap if max_gib is None else min(cap, int(float(max_gib) * 2**30))
 
     def _entry_is_attached(self, entry):
         if _is_not_available(entry.param):
