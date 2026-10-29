@@ -1587,7 +1587,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         if len(swap_in_list) > 0:
             swap_in_list[0].nvme_swapper.swap_in(swap_in_list, async_op=False)
         elif len(swap_in_flight) > 0:
-            swap_in_flight[0].nvme_swapper.synchronize_reads()
+            swap_in_flight[0].nvme_swapper.synchronize_reads(swap_in_flight)
 
     @instrument_w_nvtx
     def _all_gather(self, param_list, async_op=False, hierarchy=None):

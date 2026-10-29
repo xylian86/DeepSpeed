@@ -5,6 +5,8 @@
 
 from dataclasses import dataclass
 import collections
+import math
+import time
 from collections import UserDict
 from typing import Deque, Set
 
@@ -111,6 +113,13 @@ class PartitionedParameterCoordinator:
         self.__param_queue: Deque[__class__.__ParamInTrace] = None
         self.__prefetch_bucket_sz: int = prefetch_bucket_sz
         self.__prefetch_nvme: bool = prefetch_nvme
+        # Step at which the trace's backward starts (inf for a forward-only trace), and while recording, the step of
+        # the first backward fetch. During the forward, NVMe partitions are read ahead only up to that step.
+        self.__trace_backward_start = math.inf
+        self.__record_backward_start = None
+        # Index into the parameter trace of the first entry after the current step, for the NVMe read-ahead.
+        self.__nvme_walk_index = 0
+        self.__deep_nvme_prefetch = False
         self.hierarchy: int = 0
         self.zero_quantized_weights = zero_quantized_weights
         self.zero_quantized_nontrainable_weights = zero_quantized_nontrainable_weights
@@ -153,6 +162,8 @@ class PartitionedParameterCoordinator:
         self.__param_order = []
         self.__most_recent_step_id_param_fetched_for = collections.defaultdict(lambda: int(-1e10))
         self.__param_queue = None
+        self.__trace_backward_start = math.inf
+        self.__record_backward_start = None
 
     def is_complete_trace(self) -> bool:
         return self.__trace_mode == ZeRoTraceMode.COMPLETE
@@ -246,12 +257,15 @@ class PartitionedParameterCoordinator:
                 self.__submodule_order = tuple(self.__submodule_order)  # freeze
                 self.__param_order = tuple(self.__param_order)  # freeze
                 self.__trace_mode = ZeRoTraceMode.COMPLETE
+                if self.__record_backward_start is not None:
+                    self.__trace_backward_start = self.__record_backward_start
                 print_rank_0(
                     f"completed record trace of {len(self.__submodule_order)} sub modules: {[m.ds_id for m in self.__submodule_order]}",
                     force=False)
             else:
                 # Enable trace recording for next forward/backward pass
                 self.__trace_mode = ZeRoTraceMode.RECORD
+                self.__record_backward_start = None
 
         else:
             if self.__profiler is not None:
@@ -261,9 +275,14 @@ class PartitionedParameterCoordinator:
         self.__most_recent_step_id_param_fetched_for = collections.defaultdict(lambda: int(-1e10))
         self.__step_id_module_fetched_for = collections.defaultdict(lambda: collections.deque())
         self.__step_id = 0
+        self.__nvme_walk_index = 0
+        self.__deep_nvme_prefetch = any(
+            getattr(getattr(p.param, "nvme_swapper", None), "deep_prefetch", False) for p in self.__param_order)
         self.__n_available_params = 0
         self.__profiler.reset_events()
         self.__log_nvme_cache_stats()
+        if self.__deep_nvme_prefetch:
+            self.__release_nvme_prefetches()
 
     def _dump_params(self, tag, sub_module, params, step_id=None):
         if step_id is None:
@@ -298,11 +317,20 @@ class PartitionedParameterCoordinator:
                     "inflight": [p.ds_id for p in self.__inflight_param_registry],
                 }))
 
+        if not forward and self.__record_backward_start is None and self.is_record_trace():
+            self.__record_backward_start = self.__step_id
+
         params_to_fetch = set(iter_params(current_submodule, recurse=z3_leaf_module(current_submodule)))
         fetch_numel = sum(
             [p.partition_numel() for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
 
         if fetch_numel > 0:
+            for param in params_to_fetch:
+                swapper = getattr(param, "nvme_swapper", None)
+                if (getattr(swapper, "swap_stats", None) is not None and param.ds_status == ZeroParamStatus.NOT_AVAILABLE
+                        and param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE):
+                    phase = "fwd" if self.__step_id < self.__trace_backward_start else "bwd"
+                    swapper.count_stat(f"demand_{self.__trace_mode.name.lower()}_{phase}_{'f' if forward else 'b'}")
             event_name = __class__.FORWARD_FETCH_SUBMIT if forward else __class__.BACKWARD_FETCH_SUBMIT
             self._dump_param_ids(event_name, current_submodule.ds_id,
                                  [(p.ds_id, p.ds_shape)
@@ -588,9 +616,42 @@ class PartitionedParameterCoordinator:
         # lookahead prefetch is opportunistic; consuming every buffer can deadlock
         # the next required param behind prefetched future params.
         prefetch_buffer_reserve = 1
-        for param_in_trace in self.__param_queue:
+        free_slots = None
+        deep_swapper = None
+        # The read-ahead walks the trace, not the fetch queue: the all-gather prefetch above pops the entries of
+        # parameters that are gathered at the time, and when such a parameter is released before that use, its entry
+        # is no longer in the queue, so it would be read on demand behind every queued read.
+        order = self.__param_order
+        index = self.__nvme_walk_index
+        while index < len(order) and order[index].step_id_last_used_at <= self.__step_id:
+            index += 1
+        self.__nvme_walk_index = index
+        # The backward's first modules reuse the forward's last parameters, which are still in use while the forward
+        # ends; reading backward partitions before then fills the slots with later ones, and those parameters then
+        # have to be read on demand behind the whole queue. A pass without backward (no grad) also stops here.
+        step_limit = self.__trace_backward_start if self.__step_id < self.__trace_backward_start else math.inf
+        walk_start = time.perf_counter()
+        for param_in_trace in ((order[i] for i in range(index, len(order)))
+                               if self.__deep_nvme_prefetch else self.__param_queue):
             param = param_in_trace.param
             if param.nvme_swapper is None:
+                continue
+            if getattr(param.nvme_swapper, "deep_prefetch", False):
+                deep_swapper = param.nvme_swapper
+                # Read ahead in trace order while a slot of the partition's size is free beyond the reserve,
+                # stopping at the first that has none, so that reads stay in use order.
+                if param_in_trace.step_id_last_used_at >= step_limit:
+                    break
+                if (param.ds_tensor.status == PartitionedParamStatus.NOT_AVAILABLE
+                        and param.ds_status == ZeroParamStatus.NOT_AVAILABLE and param.ds_id not in swap_in_param_ids):
+                    if free_slots is None:
+                        free_slots = param.nvme_swapper.free_slots_by_class()
+                    slot_size = param.nvme_swapper.buffer_class(param.ds_tensor.ds_numel)
+                    if free_slots[slot_size] <= prefetch_buffer_reserve:
+                        break
+                    free_slots[slot_size] -= 1
+                    swap_in_params.append(param)
+                    swap_in_param_ids.add(param.ds_id)
                 continue
             max_prefetch_params = max(0, param.nvme_swapper.available_swap_in_buffers() - prefetch_buffer_reserve)
             if (numel_considered > 2 * numel_in_flight or len(swap_in_params) >= max_prefetch_params):
@@ -600,8 +661,20 @@ class PartitionedParameterCoordinator:
                 swap_in_param_ids.add(param.ds_id)
             numel_considered += param.ds_numel
 
+        if deep_swapper is not None:
+            deep_swapper.count_stat("prefetch_walk_s", time.perf_counter() - walk_start)
         if swap_in_params:
             swap_in_params[0].nvme_swapper.swap_in(swap_in_params, async_op=True)
+
+    def __release_nvme_prefetches(self):
+        released_swappers = set()
+        for param_in_trace in self.__param_order:
+            nvme_swapper = getattr(param_in_trace.param, "nvme_swapper", None)
+            if nvme_swapper is None or nvme_swapper in released_swappers or not getattr(
+                    nvme_swapper, "deep_prefetch", False):
+                continue
+            released_swappers.add(nvme_swapper)
+            nvme_swapper.release_prefetched_partitions()
 
     def __log_nvme_cache_stats(self):
         if not self.is_complete_trace():
